@@ -12,8 +12,9 @@ ICCAD 2026 FloorSet Challenge - Edge-GNN + DiT-Small + Hybrid B*-tree Contour Le
 import math
 import random
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -30,6 +31,1086 @@ from iccad2026_evaluate import (
     calculate_bbox_area,
     check_overlap,
 )
+
+
+@dataclass
+class BlockSpec:
+    index: int
+    area_target: float
+    width: float
+    height: float
+    is_fixed: bool
+    is_preplaced: bool
+    preplaced_x: Optional[float]
+    preplaced_y: Optional[float]
+    boundary_mask: int
+    mib_group: Optional[int]
+    cluster_group: Optional[int]
+    malformed_reasons: Tuple[str, ...] = ()
+
+
+@dataclass
+class NormalizedProblem:
+    block_count: int
+    blocks: List[BlockSpec]
+    anchors: List[int]
+    movables: List[int]
+    constraints: torch.Tensor
+    area_targets: torch.Tensor
+    target_positions: Optional[torch.Tensor]
+    b2b_connectivity: torch.Tensor
+    p2b_connectivity: torch.Tensor
+    pins_pos: torch.Tensor
+
+
+@dataclass
+class Guidance:
+    order: List[int]
+    predicted_centers: Dict[int, Tuple[float, float]]
+    predicted_positions: Dict[int, Tuple[float, float]]
+    available: bool
+    warnings: List[str]
+
+
+@dataclass
+class PlacementState:
+    positions: List[Optional[Tuple[float, float, float, float]]]
+    occupied: List[Tuple[int, Tuple[float, float, float, float]]]
+    placed_order: List[int]
+    failed: bool = False
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def is_complete(self) -> bool:
+        return all(position is not None for position in self.positions)
+
+    def as_positions(self, problem: NormalizedProblem) -> List[Tuple[float, float, float, float]]:
+        positions: List[Tuple[float, float, float, float]] = []
+        for block_id, position in enumerate(self.positions):
+            if position is None:
+                block = problem.blocks[block_id]
+                positions.append((0.0, 0.0, block.width, block.height))
+            else:
+                positions.append(position)
+        return positions
+
+
+@dataclass
+class FeasibilityReport:
+    is_feasible: bool = False
+    overlap_violations: int = 0
+    area_violations: int = 0
+    dimension_violations: int = 0
+    malformed_violations: int = 0
+    messages: List[str] = field(default_factory=list)
+
+
+class HardConstraintNormalizer:
+    TARGET_SENTINEL = -1.0
+    DEFAULT_SAFE_AREA = 1.0
+    CONSTRAINT_COLUMNS = 5
+
+    @classmethod
+    def normalize(
+        cls,
+        block_count: int,
+        area_targets: torch.Tensor,
+        b2b_connectivity: torch.Tensor,
+        p2b_connectivity: torch.Tensor,
+        pins_pos: torch.Tensor,
+        constraints: torch.Tensor,
+        target_positions: Optional[torch.Tensor],
+    ) -> NormalizedProblem:
+        normalized_constraints = cls._constraints_view(constraints, block_count)
+        normalized_areas = cls._area_targets_view(area_targets, block_count)
+
+        blocks: List[BlockSpec] = []
+        anchors: List[int] = []
+        movables: List[int] = []
+
+        for i in range(block_count):
+            is_fixed = cls._constraint_bool(normalized_constraints, i, 0)
+            is_preplaced = cls._constraint_bool(normalized_constraints, i, 1)
+            mib_group = cls._optional_group(normalized_constraints, i, 2)
+            cluster_group = cls._optional_group(normalized_constraints, i, 3)
+            boundary_mask = cls._constraint_int(normalized_constraints, i, 4)
+            area_value = cls._area_value(normalized_areas, i)
+            soft_width, soft_height = cls._soft_dimensions(area_value)
+
+            malformed: List[str] = []
+            target_width = cls._target_value(target_positions, i, 2)
+            target_height = cls._target_value(target_positions, i, 3)
+
+            if is_fixed or is_preplaced:
+                if (
+                    target_width is None
+                    or target_height is None
+                    or target_width <= 0
+                    or target_height <= 0
+                ):
+                    malformed.append("missing_or_invalid_target_dimensions")
+                    width, height = soft_width, soft_height
+                else:
+                    width, height = target_width, target_height
+            else:
+                width, height = soft_width, soft_height
+
+            preplaced_x = None
+            preplaced_y = None
+            if is_preplaced:
+                preplaced_x = cls._target_value(target_positions, i, 0)
+                preplaced_y = cls._target_value(target_positions, i, 1)
+                if preplaced_x is None or preplaced_y is None:
+                    malformed.append("missing_or_invalid_preplaced_coordinates")
+                anchors.append(i)
+            else:
+                movables.append(i)
+
+            blocks.append(BlockSpec(
+                index=i,
+                area_target=area_value,
+                width=width,
+                height=height,
+                is_fixed=is_fixed,
+                is_preplaced=is_preplaced,
+                preplaced_x=preplaced_x,
+                preplaced_y=preplaced_y,
+                boundary_mask=boundary_mask,
+                mib_group=mib_group,
+                cluster_group=cluster_group,
+                malformed_reasons=tuple(malformed),
+            ))
+
+        return NormalizedProblem(
+            block_count=block_count,
+            blocks=blocks,
+            anchors=anchors,
+            movables=movables,
+            constraints=normalized_constraints,
+            area_targets=normalized_areas,
+            target_positions=target_positions,
+            b2b_connectivity=b2b_connectivity,
+            p2b_connectivity=p2b_connectivity,
+            pins_pos=pins_pos,
+        )
+
+    @classmethod
+    def _constraints_view(cls, constraints: Optional[torch.Tensor], block_count: int) -> torch.Tensor:
+        if constraints is None:
+            return torch.zeros((block_count, cls.CONSTRAINT_COLUMNS), dtype=torch.float32)
+
+        if constraints.dim() == 1:
+            source = constraints.view(-1, 1)
+        else:
+            source = constraints
+
+        result = torch.zeros(
+            (block_count, cls.CONSTRAINT_COLUMNS),
+            dtype=source.dtype,
+            device=source.device,
+        )
+        rows = min(block_count, source.shape[0])
+        cols = min(cls.CONSTRAINT_COLUMNS, source.shape[1])
+        if rows > 0 and cols > 0:
+            result[:rows, :cols] = source[:rows, :cols]
+        return result
+
+    @staticmethod
+    def _area_targets_view(area_targets: Optional[torch.Tensor], block_count: int) -> torch.Tensor:
+        if area_targets is None:
+            return torch.ones(block_count, dtype=torch.float32)
+
+        source = area_targets.flatten()
+        result = torch.ones(block_count, dtype=source.dtype, device=source.device)
+        rows = min(block_count, source.shape[0])
+        if rows > 0:
+            result[:rows] = source[:rows]
+        return result
+
+    @staticmethod
+    def _area_value(area_targets: torch.Tensor, index: int) -> float:
+        try:
+            value = float(area_targets[index].item())
+        except (IndexError, TypeError, ValueError):
+            return HardConstraintNormalizer.DEFAULT_SAFE_AREA
+        if not math.isfinite(value):
+            return HardConstraintNormalizer.DEFAULT_SAFE_AREA
+        return value
+
+    @staticmethod
+    def _soft_dimensions(area_value: float) -> Tuple[float, float]:
+        area = area_value if math.isfinite(area_value) and area_value > 0 else HardConstraintNormalizer.DEFAULT_SAFE_AREA
+        side = math.sqrt(area)
+        return side, side
+
+    @staticmethod
+    def _target_value(target_positions: Optional[torch.Tensor], index: int, column: int) -> Optional[float]:
+        if target_positions is None or target_positions.dim() < 2:
+            return None
+        if index >= target_positions.shape[0] or column >= target_positions.shape[1]:
+            return None
+
+        value = float(target_positions[index, column].item())
+        if not math.isfinite(value) or value == HardConstraintNormalizer.TARGET_SENTINEL:
+            return None
+        return value
+
+    @staticmethod
+    def _constraint_bool(constraints: torch.Tensor, index: int, column: int) -> bool:
+        return bool(HardConstraintNormalizer._constraint_int(constraints, index, column) != 0)
+
+    @staticmethod
+    def _constraint_int(constraints: torch.Tensor, index: int, column: int) -> int:
+        try:
+            return int(constraints[index, column].item())
+        except (IndexError, TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _optional_group(constraints: torch.Tensor, index: int, column: int) -> Optional[int]:
+        group = HardConstraintNormalizer._constraint_int(constraints, index, column)
+        return group if group != 0 else None
+
+
+class DiffusionGuidanceAdapter:
+    @classmethod
+    def build(
+        cls,
+        problem: NormalizedProblem,
+        model: Optional[nn.Module],
+        device: torch.device,
+        checkpoint_loaded: bool = True,
+    ) -> Guidance:
+        if not checkpoint_loaded:
+            return cls._fallback(problem, "no_checkpoint_loaded")
+        if model is None:
+            return cls._fallback(problem, "model_unavailable")
+        if problem.block_count == 0:
+            return Guidance([], {}, {}, False, [])
+
+        try:
+            initial_guess = cls._initial_guess(problem, device)
+            valid_area = problem.area_targets.to(device).unsqueeze(-1).float()
+            valid_constraints = problem.constraints.to(device).float()
+            b2b_conn_dev = problem.b2b_connectivity.to(device)
+            t_tensor = torch.tensor([0], device=device)
+
+            with torch.no_grad():
+                predicted_offset = model(
+                    initial_guess.unsqueeze(0),
+                    valid_area,
+                    valid_constraints,
+                    b2b_conn_dev,
+                    t_tensor,
+                    problem.block_count,
+                )
+
+            predicted_xy = cls._parse_prediction(
+                problem,
+                initial_guess,
+                predicted_offset,
+            )
+        except (IndexError, RuntimeError, TypeError, ValueError) as exc:
+            return cls._fallback(problem, f"model_guidance_failed:{type(exc).__name__}")
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if predicted_xy is None:
+            return cls._fallback(problem, "invalid_model_prediction")
+
+        predicted_positions: Dict[int, Tuple[float, float]] = {}
+        predicted_centers: Dict[int, Tuple[float, float]] = {}
+        for block_id in problem.movables:
+            x, y = predicted_xy[block_id]
+            if not math.isfinite(x) or not math.isfinite(y):
+                return cls._fallback(problem, "non_finite_model_prediction")
+            block = problem.blocks[block_id]
+            predicted_positions[block_id] = (x, y)
+            predicted_centers[block_id] = (
+                x + block.width / 2.0,
+                y + block.height / 2.0,
+            )
+
+        predicted_order = sorted(
+            predicted_positions,
+            key=lambda i: (predicted_positions[i][0], predicted_positions[i][1], i),
+        )
+        missing_order = [i for i in problem.movables if i not in predicted_positions]
+        order = predicted_order + missing_order
+
+        return Guidance(
+            order=order,
+            predicted_centers=predicted_centers,
+            predicted_positions=predicted_positions,
+            available=True,
+            warnings=[],
+        )
+
+    @staticmethod
+    def _fallback(problem: NormalizedProblem, reason: str) -> Guidance:
+        return Guidance(
+            order=list(problem.movables),
+            predicted_centers={},
+            predicted_positions={},
+            available=False,
+            warnings=[reason],
+        )
+
+    @staticmethod
+    def _initial_guess(problem: NormalizedProblem, device: torch.device) -> torch.Tensor:
+        return torch.tensor(
+            [
+                (0.0, 0.0, block.width, block.height)
+                for block in problem.blocks
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+
+    @staticmethod
+    def _parse_prediction(
+        problem: NormalizedProblem,
+        initial_guess: torch.Tensor,
+        predicted_offset: torch.Tensor,
+    ) -> Optional[Dict[int, Tuple[float, float]]]:
+        if predicted_offset is None or not isinstance(predicted_offset, torch.Tensor):
+            return None
+        if predicted_offset.dim() == 3:
+            if predicted_offset.shape[0] != 1:
+                return None
+            predicted_offset = predicted_offset.squeeze(0)
+        if predicted_offset.dim() != 2:
+            return None
+        if predicted_offset.shape[0] < problem.block_count or predicted_offset.shape[1] < 2:
+            return None
+
+        predicted_offset = predicted_offset[:problem.block_count]
+        if predicted_offset.shape[1] >= 4:
+            predicted_layout = initial_guess + predicted_offset[:, :4]
+        else:
+            predicted_layout = initial_guess.clone()
+            predicted_layout[:, :2] = initial_guess[:, :2] + predicted_offset[:, :2]
+
+        if not torch.isfinite(predicted_layout[:, :2]).all():
+            return None
+
+        predicted_cpu = predicted_layout[:, :2].detach().cpu()
+        return {
+            i: (float(predicted_cpu[i, 0].item()), float(predicted_cpu[i, 1].item()))
+            for i in range(problem.block_count)
+        }
+
+
+class AnchorAwareLegalizer:
+    OVERLAP_EPS = 1e-6
+    ROUND_DIGITS = 9
+    CLOSE_EDGE_LIMIT = 12
+
+    @classmethod
+    def legalize(cls, problem: NormalizedProblem, guidance: Guidance) -> PlacementState:
+        state = PlacementState(
+            positions=[None] * problem.block_count,
+            occupied=[],
+            placed_order=[],
+        )
+
+        for block_id in problem.anchors:
+            block = problem.blocks[block_id]
+            if block.preplaced_x is None or block.preplaced_y is None:
+                state.failed = True
+                state.warnings.append(f"anchor_{block_id}_missing_coordinates")
+                continue
+
+            rect = (
+                float(block.preplaced_x),
+                float(block.preplaced_y),
+                float(block.width),
+                float(block.height),
+            )
+            if not cls._rect_is_valid(rect):
+                state.failed = True
+                state.warnings.append(f"anchor_{block_id}_invalid_rectangle")
+                continue
+            if cls._overlaps_occupied(rect, state.occupied):
+                state.failed = True
+                state.warnings.append(f"anchor_{block_id}_overlaps_existing_anchor")
+
+            state.positions[block_id] = rect
+            state.occupied.append((block_id, rect))
+            state.placed_order.append(block_id)
+
+        for block_id in cls._placement_order(problem, guidance):
+            if state.positions[block_id] is not None:
+                continue
+            rect = cls._choose_candidate(problem.blocks[block_id], state, guidance)
+            if rect is None:
+                state.failed = True
+                state.warnings.append(f"block_{block_id}_no_legal_candidate")
+                continue
+
+            state.positions[block_id] = rect
+            state.occupied.append((block_id, rect))
+            state.placed_order.append(block_id)
+
+        if not state.is_complete:
+            state.failed = True
+            state.warnings.append("placement_incomplete")
+
+        return state
+
+    @classmethod
+    def _placement_order(cls, problem: NormalizedProblem, guidance: Guidance) -> List[int]:
+        seen = set()
+        order: List[int] = []
+        movable_set = set(problem.movables)
+
+        for block_id in guidance.order:
+            if block_id in movable_set and block_id not in seen:
+                order.append(block_id)
+                seen.add(block_id)
+
+        for block_id in problem.movables:
+            if block_id not in seen:
+                order.append(block_id)
+                seen.add(block_id)
+
+        return order
+
+    @classmethod
+    def _choose_candidate(
+        cls,
+        block: BlockSpec,
+        state: PlacementState,
+        guidance: Guidance,
+    ) -> Optional[Tuple[float, float, float, float]]:
+        best_key: Optional[Tuple[float, float, float, float, float, float, int]] = None
+        best_rect: Optional[Tuple[float, float, float, float]] = None
+
+        for x, y in cls._generate_candidates(block, state, guidance):
+            rect = (x, y, float(block.width), float(block.height))
+            if not cls._rect_is_valid(rect):
+                continue
+            if cls._overlaps_occupied(rect, state.occupied):
+                continue
+
+            score = cls._score_candidate(block.index, rect, state, guidance)
+            if best_key is None or score < best_key:
+                best_key = score
+                best_rect = rect
+
+        return best_rect
+
+    @classmethod
+    def _generate_candidates(
+        cls,
+        block: BlockSpec,
+        state: PlacementState,
+        guidance: Guidance,
+    ) -> List[Tuple[float, float]]:
+        candidates: List[Tuple[float, float]] = []
+
+        def add(x: float, y: float) -> None:
+            if math.isfinite(x) and math.isfinite(y):
+                candidates.append((float(x), float(y)))
+
+        add(0.0, 0.0)
+        predicted = guidance.predicted_positions.get(block.index)
+        if predicted is not None:
+            add(predicted[0], predicted[1])
+
+        bbox = cls._bbox(state.occupied)
+        if bbox is None:
+            return cls._unique_candidates(candidates)
+
+        min_x, min_y, max_x, max_y = bbox
+        add(min_x, min_y)
+        add(max_x, min_y)
+        add(min_x, max_y)
+        add(max_x, max_y)
+
+        x_edges = [min_x, max_x, 0.0]
+        y_edges = [min_y, max_y, 0.0]
+        if predicted is not None:
+            x_edges.append(predicted[0])
+            y_edges.append(predicted[1])
+
+        for _, (x, y, width, height) in sorted(
+            state.occupied,
+            key=lambda item: (item[1][0], item[1][1], item[0]),
+        ):
+            right = x + width
+            top = y + height
+            left_candidate = x - block.width
+            bottom_candidate = y - block.height
+
+            add(right, y)
+            add(x, top)
+            add(right, top)
+            add(left_candidate, y)
+            add(x, bottom_candidate)
+            add(left_candidate, top)
+            add(right, bottom_candidate)
+            add(right, min_y)
+            add(min_x, top)
+            add(max_x, y)
+            add(x, max_y)
+
+            x_edges.extend([x, right, left_candidate])
+            y_edges.extend([y, top, bottom_candidate])
+
+        if predicted is not None:
+            pred_x, pred_y = predicted
+            close_x = cls._closest_edges(x_edges, pred_x)
+            close_y = cls._closest_edges(y_edges, pred_y)
+            for x in close_x:
+                add(x, pred_y)
+            for y in close_y:
+                add(pred_x, y)
+            for x in close_x[:6]:
+                for y in close_y[:6]:
+                    add(x, y)
+
+        return cls._unique_candidates(candidates)
+
+    @classmethod
+    def _closest_edges(cls, values: List[float], target: float) -> List[float]:
+        unique_values = sorted({
+            round(float(value), cls.ROUND_DIGITS)
+            for value in values
+            if math.isfinite(float(value))
+        })
+        unique_values.sort(key=lambda value: (abs(value - target), value))
+        return unique_values[:cls.CLOSE_EDGE_LIMIT]
+
+    @classmethod
+    def _unique_candidates(cls, candidates: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        seen = set()
+        unique: List[Tuple[float, float]] = []
+        for x, y in candidates:
+            key = (round(x, cls.ROUND_DIGITS), round(y, cls.ROUND_DIGITS))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append((x, y))
+        return unique
+
+    @classmethod
+    def _score_candidate(
+        cls,
+        block_id: int,
+        rect: Tuple[float, float, float, float],
+        state: PlacementState,
+        guidance: Guidance,
+    ) -> Tuple[float, float, float, float, float, float, int]:
+        current_bbox = cls._bbox(state.occupied)
+        expanded_bbox = cls._expanded_bbox(current_bbox, rect)
+        current_area = cls._bbox_area(current_bbox)
+        expanded_area = cls._bbox_area(expanded_bbox)
+        area_growth = max(0.0, expanded_area - current_area)
+        span = (expanded_bbox[2] - expanded_bbox[0]) + (expanded_bbox[3] - expanded_bbox[1])
+
+        predicted_center = guidance.predicted_centers.get(block_id)
+        if predicted_center is None:
+            predicted_distance = 0.0
+        else:
+            center_x = rect[0] + rect[2] / 2.0
+            center_y = rect[1] + rect[3] / 2.0
+            predicted_distance = math.hypot(
+                center_x - predicted_center[0],
+                center_y - predicted_center[1],
+            )
+
+        coordinate_bias = abs(rect[0]) + abs(rect[1])
+        return (
+            round(area_growth, cls.ROUND_DIGITS),
+            round(predicted_distance, cls.ROUND_DIGITS),
+            round(span, cls.ROUND_DIGITS),
+            round(coordinate_bias, cls.ROUND_DIGITS),
+            round(rect[1], cls.ROUND_DIGITS),
+            round(rect[0], cls.ROUND_DIGITS),
+            block_id,
+        )
+
+    @staticmethod
+    def _rect_is_valid(rect: Tuple[float, float, float, float]) -> bool:
+        x, y, width, height = rect
+        return (
+            math.isfinite(x)
+            and math.isfinite(y)
+            and math.isfinite(width)
+            and math.isfinite(height)
+            and width > 0
+            and height > 0
+        )
+
+    @classmethod
+    def _overlaps_occupied(
+        cls,
+        rect: Tuple[float, float, float, float],
+        occupied: List[Tuple[int, Tuple[float, float, float, float]]],
+    ) -> bool:
+        return any(cls._rectangles_overlap(rect, existing) for _, existing in occupied)
+
+    @classmethod
+    def _rectangles_overlap(
+        cls,
+        first: Tuple[float, float, float, float],
+        second: Tuple[float, float, float, float],
+    ) -> bool:
+        x1, y1, w1, h1 = first
+        x2, y2, w2, h2 = second
+        overlap_x = max(0.0, min(x1 + w1, x2 + w2) - max(x1, x2))
+        overlap_y = max(0.0, min(y1 + h1, y2 + h2) - max(y1, y2))
+        return overlap_x > cls.OVERLAP_EPS and overlap_y > cls.OVERLAP_EPS
+
+    @staticmethod
+    def _bbox(
+        occupied: List[Tuple[int, Tuple[float, float, float, float]]],
+    ) -> Optional[Tuple[float, float, float, float]]:
+        if not occupied:
+            return None
+
+        min_x = min(rect[0] for _, rect in occupied)
+        min_y = min(rect[1] for _, rect in occupied)
+        max_x = max(rect[0] + rect[2] for _, rect in occupied)
+        max_y = max(rect[1] + rect[3] for _, rect in occupied)
+        return (min_x, min_y, max_x, max_y)
+
+    @staticmethod
+    def _expanded_bbox(
+        bbox: Optional[Tuple[float, float, float, float]],
+        rect: Tuple[float, float, float, float],
+    ) -> Tuple[float, float, float, float]:
+        x, y, width, height = rect
+        if bbox is None:
+            return (x, y, x + width, y + height)
+        return (
+            min(bbox[0], x),
+            min(bbox[1], y),
+            max(bbox[2], x + width),
+            max(bbox[3], y + height),
+        )
+
+    @staticmethod
+    def _bbox_area(bbox: Optional[Tuple[float, float, float, float]]) -> float:
+        if bbox is None:
+            return 0.0
+        return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+
+
+class FeasibilityChecker:
+    OVERLAP_EPS = 1e-6
+    DIMENSION_TOLERANCE = 1e-4
+    AREA_TOLERANCE = 0.01
+
+    @classmethod
+    def check(
+        cls,
+        positions: List[Tuple[float, float, float, float]],
+        problem: NormalizedProblem,
+    ) -> FeasibilityReport:
+        messages: List[str] = []
+        malformed_violations = 0
+        overlap_violations = 0
+        area_violations = 0
+        dimension_violations = 0
+
+        normalized_positions: List[Optional[Tuple[float, float, float, float]]] = [
+            None
+        ] * problem.block_count
+
+        if positions is None:
+            malformed_violations += 1
+            messages.append("placement_missing")
+            input_positions: List[object] = []
+        else:
+            try:
+                input_positions = list(positions)
+            except TypeError:
+                malformed_violations += 1
+                messages.append("placement_not_iterable")
+                input_positions = []
+
+        if len(input_positions) != problem.block_count:
+            malformed_violations += 1
+            messages.append(
+                f"placement_length_mismatch:expected_{problem.block_count}:got_{len(input_positions)}"
+            )
+
+        for block_id in range(min(problem.block_count, len(input_positions))):
+            rect = cls._coerce_rect(input_positions[block_id])
+            if rect is None:
+                malformed_violations += 1
+                messages.append(f"block_{block_id}_malformed_tuple")
+                continue
+            normalized_positions[block_id] = rect
+
+        for block in problem.blocks:
+            if block.malformed_reasons:
+                malformed_violations += 1
+                reasons = ",".join(block.malformed_reasons)
+                messages.append(f"block_{block.index}_malformed_metadata:{reasons}")
+
+        for i in range(problem.block_count):
+            first = normalized_positions[i]
+            if first is None:
+                continue
+            for j in range(i + 1, problem.block_count):
+                second = normalized_positions[j]
+                if second is None:
+                    continue
+                if cls.rectangles_overlap(first, second):
+                    overlap_violations += 1
+                    messages.append(f"overlap:{i}:{j}")
+
+        for block_id, block in enumerate(problem.blocks):
+            rect = normalized_positions[block_id]
+            if rect is None:
+                continue
+
+            x, y, width, height = rect
+            if block.is_fixed or block.is_preplaced:
+                dimension_mismatch = (
+                    abs(width - block.width) > cls.DIMENSION_TOLERANCE
+                    or abs(height - block.height) > cls.DIMENSION_TOLERANCE
+                )
+                position_mismatch = False
+                if block.is_preplaced:
+                    if block.preplaced_x is None or block.preplaced_y is None:
+                        position_mismatch = True
+                    else:
+                        position_mismatch = (
+                            abs(x - block.preplaced_x) > cls.DIMENSION_TOLERANCE
+                            or abs(y - block.preplaced_y) > cls.DIMENSION_TOLERANCE
+                        )
+
+                if dimension_mismatch or position_mismatch:
+                    dimension_violations += 1
+                    messages.append(f"block_{block_id}_fixed_or_preplaced_mismatch")
+                continue
+
+            target_area = block.area_target
+            if math.isfinite(target_area) and target_area > 0:
+                relative_error = abs((width * height) - target_area) / target_area
+                if relative_error > cls.AREA_TOLERANCE:
+                    area_violations += 1
+                    messages.append(f"block_{block_id}_area_error:{relative_error:.6g}")
+
+        is_feasible = (
+            malformed_violations == 0
+            and overlap_violations == 0
+            and area_violations == 0
+            and dimension_violations == 0
+        )
+        return FeasibilityReport(
+            is_feasible=is_feasible,
+            overlap_violations=overlap_violations,
+            area_violations=area_violations,
+            dimension_violations=dimension_violations,
+            malformed_violations=malformed_violations,
+            messages=messages,
+        )
+
+    @classmethod
+    def rectangles_overlap(
+        cls,
+        first: Tuple[float, float, float, float],
+        second: Tuple[float, float, float, float],
+    ) -> bool:
+        x1, y1, w1, h1 = first
+        x2, y2, w2, h2 = second
+        overlap_x = max(0.0, min(x1 + w1, x2 + w2) - max(x1, x2))
+        overlap_y = max(0.0, min(y1 + h1, y2 + h2) - max(y1, y2))
+        return overlap_x > cls.OVERLAP_EPS and overlap_y > cls.OVERLAP_EPS
+
+    @staticmethod
+    def _coerce_rect(position: object) -> Optional[Tuple[float, float, float, float]]:
+        try:
+            if len(position) != 4:  # type: ignore[arg-type]
+                return None
+            x, y, width, height = (float(value) for value in position)  # type: ignore[union-attr]
+        except (TypeError, ValueError):
+            return None
+
+        if not (
+            math.isfinite(x)
+            and math.isfinite(y)
+            and math.isfinite(width)
+            and math.isfinite(height)
+        ):
+            return None
+        if width <= 0 or height <= 0:
+            return None
+        return (x, y, width, height)
+
+
+class FeasibleFallbackPacker:
+    ROW_WIDTH_FACTOR = 1.75
+    SCAN_STEP_FACTOR = 64
+    MIN_ADVANCE = 1e-9
+
+    @classmethod
+    def pack(
+        cls,
+        problem: NormalizedProblem,
+        guidance: Optional[Guidance] = None,
+    ) -> List[Tuple[float, float, float, float]]:
+        state = PlacementState(
+            positions=[None] * problem.block_count,
+            occupied=[],
+            placed_order=[],
+        )
+
+        for block_id in problem.anchors:
+            block = problem.blocks[block_id]
+            if block.preplaced_x is None or block.preplaced_y is None:
+                continue
+            rect = (
+                float(block.preplaced_x),
+                float(block.preplaced_y),
+                float(block.width),
+                float(block.height),
+            )
+            state.positions[block_id] = rect
+            state.occupied.append((block_id, rect))
+            state.placed_order.append(block_id)
+
+        row_start_x = cls._initial_row_start(state)
+        row_width = cls._row_width(problem, state, row_start_x)
+        cursor_x = row_start_x
+        cursor_y = cls._initial_row_y(state)
+        row_height = 0.0
+
+        for block_id in cls._placement_order(problem, guidance):
+            if state.positions[block_id] is not None:
+                continue
+            block = problem.blocks[block_id]
+            rect, cursor_x, cursor_y, row_height = cls._row_strip_slot(
+                block,
+                state,
+                cursor_x,
+                cursor_y,
+                row_height,
+                row_start_x,
+                row_width,
+            )
+            state.positions[block_id] = rect
+            state.occupied.append((block_id, rect))
+            state.placed_order.append(block_id)
+
+        return state.as_positions(problem)
+
+    @staticmethod
+    def _placement_order(
+        problem: NormalizedProblem,
+        guidance: Optional[Guidance],
+    ) -> List[int]:
+        movable_set = set(problem.movables)
+        seen = set()
+        order: List[int] = []
+
+        if guidance is not None:
+            for block_id in guidance.order:
+                if block_id in movable_set and block_id not in seen:
+                    order.append(block_id)
+                    seen.add(block_id)
+
+        for block_id in problem.movables:
+            if block_id not in seen:
+                order.append(block_id)
+                seen.add(block_id)
+        return order
+
+    @classmethod
+    def _row_strip_slot(
+        cls,
+        block: BlockSpec,
+        state: PlacementState,
+        cursor_x: float,
+        cursor_y: float,
+        row_height: float,
+        row_start_x: float,
+        row_width: float,
+    ) -> Tuple[
+        Tuple[float, float, float, float],
+        float,
+        float,
+        float,
+    ]:
+        width = float(block.width)
+        height = float(block.height)
+        if (
+            not math.isfinite(width)
+            or not math.isfinite(height)
+            or width <= 0
+            or height <= 0
+        ):
+            rect = (cursor_x, cursor_y, width, height)
+            return rect, cursor_x, cursor_y, row_height
+
+        row_limit_x = row_start_x + max(row_width, width)
+        current_x = cursor_x
+        current_y = cursor_y
+        current_row_height = row_height
+        max_steps = max(256, (len(state.occupied) + 1) * cls.SCAN_STEP_FACTOR)
+
+        for _ in range(max_steps):
+            if current_x + width > row_limit_x and current_x > row_start_x:
+                current_y = cls._next_row_y(
+                    current_y,
+                    max(current_row_height, height),
+                    height,
+                    state,
+                )
+                current_x = row_start_x
+                current_row_height = 0.0
+                continue
+
+            rect = (current_x, current_y, width, height)
+            jump_x = cls._collision_jump_x(rect, state)
+            if jump_x is None:
+                next_x = current_x + width
+                next_y = current_y
+                next_row_height = max(current_row_height, height)
+                if next_x > row_limit_x:
+                    next_y = cls._next_row_y(
+                        current_y,
+                        next_row_height,
+                        height,
+                        state,
+                    )
+                    next_x = row_start_x
+                    next_row_height = 0.0
+                return rect, next_x, next_y, next_row_height
+
+            current_x = max(jump_x, current_x + cls.MIN_ADVANCE)
+            if current_x + width > row_limit_x:
+                current_y = cls._next_row_y(
+                    current_y,
+                    max(current_row_height, height),
+                    height,
+                    state,
+                )
+                current_x = row_start_x
+                current_row_height = 0.0
+
+        # The cursor scan should normally find a slot. If malformed geometry
+        # prevents progress, expand to the right of the occupied bounding box
+        # so the final checker reports any remaining hard-input contradiction.
+        rect = cls._right_expansion_slot(width, height, state)
+        next_x = rect[0] + width
+        return rect, next_x, rect[1], max(row_height, height)
+
+    @staticmethod
+    def _initial_row_start(state: PlacementState) -> float:
+        bbox = AnchorAwareLegalizer._bbox(state.occupied)
+        if bbox is None:
+            return 0.0
+        return min(0.0, bbox[0])
+
+    @staticmethod
+    def _initial_row_y(state: PlacementState) -> float:
+        bbox = AnchorAwareLegalizer._bbox(state.occupied)
+        if bbox is None:
+            return 0.0
+        return min(0.0, bbox[1])
+
+    @classmethod
+    def _row_width(
+        cls,
+        problem: NormalizedProblem,
+        state: PlacementState,
+        row_start_x: float,
+    ) -> float:
+        block_areas = [
+            max(0.0, float(block.width) * float(block.height))
+            for block in problem.blocks
+            if math.isfinite(float(block.width)) and math.isfinite(float(block.height))
+        ]
+        max_width = max(
+            [
+                float(block.width)
+                for block in problem.blocks
+                if math.isfinite(float(block.width)) and float(block.width) > 0
+            ]
+            or [1.0]
+        )
+        area_side = math.sqrt(sum(block_areas)) if block_areas else max_width
+
+        bbox = AnchorAwareLegalizer._bbox(state.occupied)
+        anchor_span = 0.0
+        if bbox is not None:
+            anchor_span = max(0.0, bbox[2] - row_start_x)
+
+        return max(
+            max_width,
+            area_side * cls.ROW_WIDTH_FACTOR,
+            anchor_span + max_width,
+        )
+
+    @classmethod
+    def _collision_jump_x(
+        cls,
+        rect: Tuple[float, float, float, float],
+        state: PlacementState,
+    ) -> Optional[float]:
+        jump_x = None
+        for _, existing in state.occupied:
+            if not AnchorAwareLegalizer._rectangles_overlap(rect, existing):
+                continue
+            right_edge = existing[0] + existing[2]
+            jump_x = right_edge if jump_x is None else max(jump_x, right_edge)
+        return jump_x
+
+    @classmethod
+    def _next_row_y(
+        cls,
+        current_y: float,
+        row_height: float,
+        block_height: float,
+        state: PlacementState,
+    ) -> float:
+        next_y = current_y + max(row_height, block_height, cls.MIN_ADVANCE)
+        for _, (_, y, _, height) in state.occupied:
+            if cls._intervals_overlap(current_y, current_y + block_height, y, y + height):
+                next_y = max(next_y, y + height)
+        return next_y
+
+    @staticmethod
+    def _intervals_overlap(
+        first_start: float,
+        first_end: float,
+        second_start: float,
+        second_end: float,
+    ) -> bool:
+        overlap = min(first_end, second_end) - max(first_start, second_start)
+        return overlap > AnchorAwareLegalizer.OVERLAP_EPS
+
+    @staticmethod
+    def _right_expansion_slot(
+        width: float,
+        height: float,
+        state: PlacementState,
+    ) -> Tuple[float, float, float, float]:
+        bbox = AnchorAwareLegalizer._bbox(state.occupied)
+        if bbox is None:
+            return (0.0, 0.0, width, height)
+        return (bbox[2], bbox[1], width, height)
+
+
+class SoftConstraintImprover:
+    @classmethod
+    def improve(
+        cls,
+        problem: NormalizedProblem,
+        placement: List[Tuple[float, float, float, float]],
+        checker: Optional[object] = None,
+    ) -> List[Tuple[float, float, float, float]]:
+        # Boundary, grouping, and MIB moves stay disabled until checker-backed
+        # move acceptance is implemented. A copy keeps this stage mutation-free.
+        return [tuple(rect) for rect in placement]
+
 
 # =============================================================================
 # 1. NETLIST EDGE-GNN (電路圖拓樸特徵提取器) - 完全與訓練端對齊
@@ -289,6 +1370,7 @@ class MyOptimizer(FloorplanOptimizer):
         # 自動尋找最新一輪的 .pth 檔案
         weight_path = Path(__file__).parent / "checkpoints"
         latest_weight = list(weight_path.glob("*.pth")) if weight_path.exists() else []
+        self.checkpoint_loaded = bool(latest_weight)
         if latest_weight:
             # 排序抓取最新的一顆權重
             latest_weight.sort()
@@ -297,7 +1379,7 @@ class MyOptimizer(FloorplanOptimizer):
                 print(f"--> [A100 GPU] Successfully loaded Edge-GNN + DiT Checkpoint: {latest_weight[-1].name}")
         else:
             if self.verbose:
-                print("--> WARNING: No weights found in checkpoints/. Running initial graph.")
+                print("--> WARNING: No weights found in checkpoints/. Using deterministic guidance fallback.")
                 
         self.model.to(self.device)
         self.model.eval() # 🚀 關閉 Dropout, 進入高效推論模式
@@ -313,95 +1395,58 @@ class MyOptimizer(FloorplanOptimizer):
         target_positions: torch.Tensor = None
     ) -> List[Tuple[float, float, float, float]]:
         
-        effective_blocks = min(block_count, 1000)
-        
-        # =========================================================================
-        # 階段一：準備與訓練完全對齊的尺寸與面積
-        # =========================================================================
-        widths, heights = [], []
-        for i in range(effective_blocks):
-            if target_positions is not None and target_positions[i, 2] != -1 and target_positions[i, 3] != -1:
-                w = float(target_positions[i, 2])
-                h = float(target_positions[i, 3])
-            else:
-                area = float(area_targets[i]) if area_targets[i] > 0 else 1.0
-                w = h = math.sqrt(area)
-            widths.append(w)
-            heights.append(h)
+        effective_blocks = block_count
+        problem = HardConstraintNormalizer.normalize(
+            effective_blocks,
+            area_targets,
+            b2b_connectivity,
+            p2b_connectivity,
+            pins_pos,
+            constraints,
+            target_positions,
+        )
+        if effective_blocks == 0:
+            return []
 
         # =========================================================================
-        # 階段二：AI 階段 ── 呼叫 Edge-GNN + DiT-Small 進行全域拓樸預測
+        # 階段二：AI 階段 ── 建立只作為排序/候選偏好的擴散指引
         # =========================================================================
-        init_x = torch.zeros(effective_blocks, device=self.device)
-        init_y = torch.zeros(effective_blocks, device=self.device)
-        init_w = torch.tensor(widths, device=self.device)
-        init_h = torch.tensor(heights, device=self.device)
-        initial_guess = torch.stack([init_x, init_y, init_w, init_h], dim=1).float()
-        
-        # 轉換符合 GNN 接口的變數維度
-        valid_area = area_targets[:effective_blocks].unsqueeze(-1).to(self.device).float()
-        valid_constraints = constraints[:effective_blocks].to(self.device).float()
-        b2b_conn_dev = b2b_connectivity.to(self.device)
-        noised_input_b = initial_guess.unsqueeze(0)
-        
-        t_tensor = torch.tensor([0], device=self.device)
-        
-        with torch.no_grad(): # 🚀 關閉梯度，保障 A100 安全不 OOM
-            predicted_offset = self.model(
-                noised_input_b, 
-                valid_area, 
-                valid_constraints, 
-                b2b_conn_dev, 
-                t_tensor, 
-                effective_blocks
+        guidance = DiffusionGuidanceAdapter.build(
+            problem,
+            self.model,
+            self.device,
+            checkpoint_loaded=self.checkpoint_loaded,
+        )
+
+        # =========================================================================
+        # 階段三：Anchor-aware legalization ── preplaced anchors are obstacles
+        # =========================================================================
+        placement_state = AnchorAwareLegalizer.legalize(problem, guidance)
+        if self.verbose and placement_state.warnings:
+            print(f"--> Anchor-aware legalizer warnings: {placement_state.warnings}")
+
+        checker = FeasibilityChecker()
+        legalized_positions = placement_state.as_positions(problem)
+        improved_positions = SoftConstraintImprover.improve(problem, legalized_positions, checker)
+        optimized_report = checker.check(improved_positions, problem)
+        if not placement_state.failed and optimized_report.is_feasible:
+            return improved_positions
+
+        if self.verbose:
+            print(
+                "--> Optimized placement failed hard-feasibility check; "
+                f"routing to fallback: {optimized_report.messages[:8]}"
             )
-            ai_positions_tensor = initial_guess + predicted_offset.squeeze(0)
-            
-        ai_layout = []
-        for i in range(effective_blocks):
-            ai_layout.append((
-                float(ai_positions_tensor[i, 0]),
-                float(ai_positions_tensor[i, 1]),
-                float(ai_positions_tensor[i, 2]),
-                float(ai_positions_tensor[i, 3])
-            ))
-            
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
-        # =========================================================================
-        # 階段三：CONTOUR LEGALIZATION ── 強制 100% 絕對無重疊
-        # =========================================================================
-        legalizer = BStarTreeLegalizer(effective_blocks, widths, heights)
-        legalizer.build_from_ai_coordinates(ai_layout)
-        packed_layout = legalizer.pack()
-        
-        # =========================================================================
-        # 階段四：HARD CONSTRAINTS CORRECTOR ── 靠牆與 Preplaced 絕對鎖定
-        # =========================================================================
-        final_layout = [list(p) for p in packed_layout]
-        
-        x_min_bb = min(p[0] for p in final_layout)
-        y_min_bb = min(p[1] for p in final_layout)
-        x_max_bb = max(p[0] + p[2] for p in final_layout)
-        y_max_bb = max(p[1] + p[3] for p in final_layout)
-        
-        for i in range(effective_blocks):
-            if target_positions is not None and target_positions[i, 0] != -1 and target_positions[i, 1] != -1:
-                final_layout[i][0] = float(target_positions[i, 0])
-                final_layout[i][1] = float(target_positions[i, 1])
-                continue
+        fallback_positions = FeasibleFallbackPacker.pack(problem, guidance)
+        fallback_report = checker.check(fallback_positions, problem)
+        if fallback_report.is_feasible:
+            return fallback_positions
 
-            if constraints is not None and constraints.shape[1] > 4:
-                bound_code = int(constraints[i, 4].item())
-                if bound_code > 0:
-                    if bound_code & 1:   # Left
-                        final_layout[i][0] = x_min_bb
-                    if bound_code & 2:   # Right
-                        final_layout[i][0] = x_max_bb - final_layout[i][2]
-                    if bound_code & 4:   # Top
-                        final_layout[i][1] = y_max_bb - final_layout[i][3]
-                    if bound_code & 8:   # Bottom
-                        final_layout[i][1] = y_min_bb
+        if self.verbose:
+            print(f"--> Fallback placement remains infeasible: {fallback_report.messages[:8]}")
 
-        return [tuple(p) for p in final_layout]
+        # Contradictory hard inputs, such as overlapping immutable anchors, cannot
+        # be repaired locally. Return the deterministic fallback so the evaluator
+        # reports hard violations instead of turning the case into an exception.
+        return fallback_positions
