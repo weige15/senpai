@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from iccad2026contest.iccad2026_evaluate import (
     compute_training_loss_differentiable,
+    compute_training_loss_differentiable_batch,
 )
 from lite_dataset import FloorplanDatasetLite, floorplan_collate as train_floorplan_collate
 
@@ -51,28 +52,62 @@ class NetlistGNN(nn.Module):
         )
 
     def forward(self, constraints, area_target, b2b_conn, block_count):
-        N = block_count
-        raw_nodes = torch.cat([constraints, area_target], dim=-1) # [N, 6]
-        h = self.node_init(raw_nodes) # [N, hidden_dim]
-        
-        valid_mask = b2b_conn[:, 0] >= 0
-        edges = b2b_conn[valid_mask]
-        
-        if edges.numel() > 0:
-            idx_i = edges[:, 0].long()
-            idx_j = edges[:, 1].long()
-            weight = edges[:, 2].to(dtype=h.dtype).unsqueeze(-1)
-            
-            msg_to_i = h[idx_j] * weight
-            msg_to_j = h[idx_i] * weight
-            
+        single_sample = constraints.dim() == 2
+        if single_sample:
+            constraints = constraints.unsqueeze(0)
+            area_target = area_target.unsqueeze(0)
+            b2b_conn = b2b_conn.unsqueeze(0)
+
+        if area_target.dim() == 2:
+            area_target = area_target.unsqueeze(-1)
+
+        batch_size, n_blocks, _ = constraints.shape
+        device = constraints.device
+        if isinstance(block_count, torch.Tensor):
+            if block_count.dtype == torch.bool and block_count.dim() == 2:
+                node_mask = block_count.to(device=device)
+            else:
+                counts = block_count.to(device=device).long().view(-1)
+                node_mask = torch.arange(n_blocks, device=device).unsqueeze(0) < counts.unsqueeze(1)
+        elif block_count is None:
+            node_mask = area_target.squeeze(-1) > 0
+        else:
+            counts = torch.full((batch_size,), int(block_count), device=device, dtype=torch.long)
+            node_mask = torch.arange(n_blocks, device=device).unsqueeze(0) < counts.unsqueeze(1)
+
+        raw_nodes = torch.cat([constraints, area_target], dim=-1)
+        h = self.node_init(raw_nodes)
+        h = h * node_mask.unsqueeze(-1).to(dtype=h.dtype)
+
+        if b2b_conn.numel() > 0:
+            idx_i_raw = b2b_conn[:, :, 0]
+            idx_j_raw = b2b_conn[:, :, 1]
+            idx_i = idx_i_raw.clamp(min=0, max=max(n_blocks - 1, 0)).long()
+            idx_j = idx_j_raw.clamp(min=0, max=max(n_blocks - 1, 0)).long()
+            valid_edges = (
+                (idx_i_raw >= 0) & (idx_j_raw >= 0)
+                & (idx_i_raw < n_blocks) & (idx_j_raw < n_blocks)
+                & node_mask.gather(1, idx_i)
+                & node_mask.gather(1, idx_j)
+            )
+
+            idx_i_expanded = idx_i.unsqueeze(-1).expand(-1, -1, h.size(-1))
+            idx_j_expanded = idx_j.unsqueeze(-1).expand(-1, -1, h.size(-1))
+            h_i = h.gather(1, idx_i_expanded)
+            h_j = h.gather(1, idx_j_expanded)
+            weight = (
+                b2b_conn[:, :, 2].to(dtype=h.dtype).unsqueeze(-1)
+                * valid_edges.unsqueeze(-1).to(dtype=h.dtype)
+            )
+
             agg_msg = torch.zeros_like(h)
-            agg_msg.index_add_(0, idx_i, msg_to_i)
-            agg_msg.index_add_(0, idx_j, msg_to_j)
-            
+            agg_msg.scatter_add_(1, idx_i_expanded, h_j * weight)
+            agg_msg.scatter_add_(1, idx_j_expanded, h_i * weight)
+
             h = self.msg_merge(torch.cat([h, agg_msg], dim=-1))
-            
-        return h
+            h = h * node_mask.unsqueeze(-1).to(dtype=h.dtype)
+
+        return h.squeeze(0) if single_sample else h
 
 
 # =============================================================================
@@ -125,10 +160,16 @@ class DiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size),
         )
 
-    def forward(self, x, c_node):
+    def forward(self, x, c_node, key_padding_mask=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c_node).chunk(6, dim=-1)
         res_attn = (self.norm1(x) * (1 + scale_msa) + shift_msa)
-        attn_out, _ = self.attn(res_attn, res_attn, res_attn)
+        attn_out, _ = self.attn(
+            res_attn,
+            res_attn,
+            res_attn,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
         x = x + gate_msa * attn_out
         res_mlp = (self.norm2(x) * (1 + scale_mlp) + shift_mlp)
         x = x + gate_mlp * self.mlp(res_mlp)
@@ -163,20 +204,56 @@ class DiTSmallFloorplanBackbone(nn.Module):
         )
 
     def forward(self, noised_positions, area_target, constraints, b2b_conn, t, block_count):
+        if noised_positions.dim() == 2:
+            noised_positions = noised_positions.unsqueeze(0)
+        batch_size, n_blocks, _ = noised_positions.shape
+
+        if area_target.dim() == 1:
+            area_target = area_target.unsqueeze(0).unsqueeze(-1)
+        elif area_target.dim() == 2:
+            if area_target.shape == noised_positions.shape[:2]:
+                area_target = area_target.unsqueeze(-1)
+            else:
+                area_target = area_target.unsqueeze(0)
+
+        if constraints.dim() == 2:
+            constraints = constraints.unsqueeze(0)
+        if b2b_conn.dim() == 2:
+            b2b_conn = b2b_conn.unsqueeze(0)
+
+        if isinstance(block_count, torch.Tensor):
+            if block_count.dtype == torch.bool and block_count.dim() == 2:
+                block_mask = block_count.to(device=noised_positions.device)
+            else:
+                counts = block_count.to(device=noised_positions.device).long().view(-1)
+                block_mask = torch.arange(n_blocks, device=noised_positions.device).unsqueeze(0) < counts.unsqueeze(1)
+        elif block_count is None:
+            block_mask = area_target.squeeze(-1) > 0
+        else:
+            counts = torch.full((batch_size,), int(block_count), device=noised_positions.device, dtype=torch.long)
+            block_mask = torch.arange(n_blocks, device=noised_positions.device).unsqueeze(0) < counts.unsqueeze(1)
+
+        if t.dim() == 0:
+            t = t.view(1)
+        if t.numel() == 1 and batch_size > 1:
+            t = t.expand(batch_size)
+
         x = self.coord_embedder(noised_positions)
+        x = x * block_mask.unsqueeze(-1).to(dtype=x.dtype)
         gnn_feats = self.gnn_encoder(constraints, area_target, b2b_conn, block_count)
-        gnn_feats_b = gnn_feats.unsqueeze(0)
         t_feat = self.t_embedder(t)
-        t_feat_b = t_feat.unsqueeze(1).expand(-1, block_count, -1)
-        c_node = self.cond_fusion(torch.cat([gnn_feats_b, t_feat_b], dim=-1))
-        
+        t_feat_b = t_feat.unsqueeze(1).expand(-1, n_blocks, -1)
+        c_node = self.cond_fusion(torch.cat([gnn_feats, t_feat_b], dim=-1))
+        key_padding_mask = ~block_mask
+
         for block in self.blocks:
-            x = block(x, c_node)
-            
+            x = block(x, c_node, key_padding_mask=key_padding_mask)
+            x = x * block_mask.unsqueeze(-1).to(dtype=x.dtype)
+
         shift, scale = self.final_adaLN(t_feat).chunk(2, dim=-1)
         x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
         output = self.final_layer(x)
-        return output
+        return output * block_mask.unsqueeze(-1).to(dtype=output.dtype)
 
 
 # =============================================================================
@@ -481,6 +558,56 @@ def compute_sample_loss(model, batch, sample_idx: int, device, max_blocks: int, 
     )
 
 
+def compute_batch_loss(model, batch, device, max_blocks: int, noise_std: float):
+    area_target, b2b_conn, p2b_conn, pins_pos, constraints, _tree_sol, fp_sol, metrics = batch
+
+    n_blocks = area_target.shape[1]
+    if max_blocks is not None:
+        n_blocks = min(n_blocks, max_blocks)
+
+    area_target = area_target[:, :n_blocks]
+    constraints = constraints[:, :n_blocks].float()
+    fp_sol = fp_sol[:, :n_blocks].float()
+    block_mask = area_target > 0
+    valid_samples = block_mask.any(dim=1)
+    if not valid_samples.any():
+        return None
+
+    ground_truth = torch.stack([
+        fp_sol[:, :, 2],
+        fp_sol[:, :, 3],
+        fp_sol[:, :, 0],
+        fp_sol[:, :, 1],
+    ], dim=-1)
+    ground_truth = ground_truth.masked_fill(~block_mask.unsqueeze(-1), 0.0)
+
+    t_step = torch.randint(0, 1000, (area_target.shape[0],), device=device)
+    noise = torch.randn_like(ground_truth) * noise_std
+    noise = noise * block_mask.unsqueeze(-1).to(dtype=noise.dtype)
+    noised_input = ground_truth + noise
+
+    predicted_denoise = model(
+        noised_input,
+        area_target.unsqueeze(-1).float(),
+        constraints,
+        b2b_conn,
+        t_step,
+        block_mask,
+    )
+    positions = noised_input + predicted_denoise
+
+    losses = compute_training_loss_differentiable_batch(
+        positions,
+        b2b_conn,
+        p2b_conn,
+        pins_pos,
+        area_target,
+        metrics,
+        block_mask=block_mask,
+    )
+    return losses[valid_samples].mean()
+
+
 # =============================================================================
 # 6. MAIN TRAINING LOOP (WITH BATCHING AND DDP)
 # =============================================================================
@@ -503,6 +630,10 @@ def main():
                 device = torch.device("cuda")
         else:
             device = torch.device("cpu")
+
+        if device.type == "cuda":
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
 
         log_main(rank, f"Detected Runtime Device: {device}")
         log_main(rank, f"World Size: {world_size}")
@@ -564,7 +695,7 @@ def main():
                 dataloader.sampler.set_epoch(epoch)
 
             model.train()
-            epoch_loss = 0.0
+            epoch_loss = torch.zeros((), device=device)
             processed_batches = 0
 
             for batch_idx, batch in enumerate(dataloader):
@@ -575,23 +706,15 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
 
                 with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
-                    losses = []
-                    for sample_idx in range(batch[0].shape[0]):
-                        loss = compute_sample_loss(
-                            model,
-                            batch,
-                            sample_idx,
-                            device,
-                            args.max_blocks,
-                            args.noise_std,
-                        )
-                        if loss is not None:
-                            losses.append(loss)
-
-                    if not losses:
+                    batch_loss = compute_batch_loss(
+                        model,
+                        batch,
+                        device,
+                        args.max_blocks,
+                        args.noise_std,
+                    )
+                    if batch_loss is None:
                         continue
-
-                    batch_loss = torch.stack(losses).mean()
 
                 scaler.scale(batch_loss).backward()
                 scaler.step(optimizer)
@@ -602,25 +725,27 @@ def main():
                 processed_batches += 1
 
                 log_loss = reduce_mean(batch_loss, distributed, world_size)
-                epoch_loss += log_loss.item()
+                epoch_loss = epoch_loss + log_loss
 
                 if args.log_freq > 0 and global_step % args.log_freq == 0:
+                    log_loss_value = log_loss.item()
                     log_main(
                         rank,
                         f"  Batch [{batch_idx + 1}/{len(dataloader)}] "
-                        f"(Global Step {global_step}) -> Loss: {log_loss.item():.4f}",
+                        f"(Global Step {global_step}) -> Loss: {log_loss_value:.4f}",
                     )
 
                 if args.save_freq_batches > 0 and global_step % args.save_freq_batches == 0:
                     if is_main_process(rank):
+                        log_loss_value = log_loss.item()
                         checkpoint_folder.mkdir(exist_ok=True, parents=True)
-                        checkpoint_name = f"dit_gnn_step_{global_step}_loss_{log_loss.item():.2f}.pth"
+                        checkpoint_name = f"dit_gnn_step_{global_step}_loss_{log_loss_value:.2f}.pth"
                         save_path = checkpoint_folder / checkpoint_name
                         save_checkpoint(model, save_path)
                         print(f"    [Checkpoint] Saved: {save_path}", flush=True)
 
             if processed_batches > 0:
-                avg_epoch_loss = epoch_loss / processed_batches
+                avg_epoch_loss = (epoch_loss / processed_batches).item()
                 log_main(rank, f"Epoch {epoch} Completed. Average Loss: {avg_epoch_loss:.4f}")
 
             if is_main_process(rank):

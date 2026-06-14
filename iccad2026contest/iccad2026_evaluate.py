@@ -1260,6 +1260,172 @@ def compute_training_loss(
     return result
 
 
+def compute_training_loss_differentiable_batch(
+    positions: torch.Tensor,
+    b2b_connectivity: torch.Tensor,
+    p2b_connectivity: torch.Tensor,
+    pins_pos: torch.Tensor,
+    area_targets: torch.Tensor,
+    baseline_metrics: torch.Tensor,
+    block_mask: Optional[torch.Tensor] = None,
+    constraints: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Batched differentiable FloorSet proxy loss.
+
+    Args mirror ``compute_training_loss_differentiable`` but use leading batch
+    dimensions: positions [B, N, 4], edge tensors [B, E, 3], pins [B, P, 2].
+    Padding is ignored through ``block_mask`` or ``area_targets > 0``.
+
+    Returns:
+        Tensor [B] with one differentiable scalar loss per sample.
+    """
+    if positions.dim() == 2:
+        positions = positions.unsqueeze(0)
+    if b2b_connectivity.dim() == 2:
+        b2b_connectivity = b2b_connectivity.unsqueeze(0)
+    if p2b_connectivity.dim() == 2:
+        p2b_connectivity = p2b_connectivity.unsqueeze(0)
+    if pins_pos.dim() == 2:
+        pins_pos = pins_pos.unsqueeze(0)
+    if area_targets.dim() == 1:
+        area_targets = area_targets.unsqueeze(0)
+    elif area_targets.dim() == 3 and area_targets.shape[-1] == 1:
+        area_targets = area_targets.squeeze(-1)
+    if baseline_metrics.dim() == 1:
+        baseline_metrics = baseline_metrics.unsqueeze(0)
+
+    # Keep the proxy numerics stable under AMP while preserving gradients.
+    positions = positions.float()
+    area_targets = area_targets.to(device=positions.device, dtype=positions.dtype)
+    b2b_connectivity = b2b_connectivity.to(device=positions.device)
+    p2b_connectivity = p2b_connectivity.to(device=positions.device)
+    pins_pos = pins_pos.to(device=positions.device, dtype=positions.dtype)
+    baseline_metrics = baseline_metrics.to(device=positions.device, dtype=positions.dtype)
+
+    batch_size, n_blocks, _ = positions.shape
+    if block_mask is None:
+        block_mask = area_targets > 0
+    else:
+        if block_mask.dim() == 1:
+            block_mask = block_mask.unsqueeze(0)
+        elif block_mask.dim() == 3 and block_mask.shape[-1] == 1:
+            block_mask = block_mask.squeeze(-1)
+        block_mask = block_mask.to(device=positions.device, dtype=torch.bool)
+
+    # Unpack positions: [x, y, w, h]
+    x = positions[:, :, 0]
+    y = positions[:, :, 1]
+    w = positions[:, :, 2]
+    h = positions[:, :, 3]
+
+    # Compute centroids
+    cx = x + w / 2
+    cy = y + h / 2
+
+    # HPWL, vectorized over padded edge lists.
+    hpwl_b2b = torch.zeros(batch_size, device=positions.device, dtype=positions.dtype)
+    if b2b_connectivity.numel() > 0:
+        b2b_i_raw = b2b_connectivity[:, :, 0]
+        b2b_j_raw = b2b_connectivity[:, :, 1]
+        b2b_i = b2b_i_raw.clamp(min=0, max=max(n_blocks - 1, 0)).long()
+        b2b_j = b2b_j_raw.clamp(min=0, max=max(n_blocks - 1, 0)).long()
+        valid_b2b = (
+            (b2b_i_raw >= 0) & (b2b_j_raw >= 0)
+            & (b2b_i_raw < n_blocks) & (b2b_j_raw < n_blocks)
+            & block_mask.gather(1, b2b_i)
+            & block_mask.gather(1, b2b_j)
+        )
+        dx = torch.abs(cx.gather(1, b2b_i) - cx.gather(1, b2b_j))
+        dy = torch.abs(cy.gather(1, b2b_i) - cy.gather(1, b2b_j))
+        weight = b2b_connectivity[:, :, 2].to(dtype=positions.dtype)
+        hpwl_b2b = (weight * (dx + dy) * valid_b2b.to(dtype=positions.dtype)).sum(dim=1)
+
+    hpwl_p2b = torch.zeros(batch_size, device=positions.device, dtype=positions.dtype)
+    if p2b_connectivity.numel() > 0 and pins_pos.shape[1] > 0:
+        n_pins = pins_pos.shape[1]
+        pin_raw = p2b_connectivity[:, :, 0]
+        block_raw = p2b_connectivity[:, :, 1]
+        pin_idx = pin_raw.clamp(min=0, max=max(n_pins - 1, 0)).long()
+        block_idx = block_raw.clamp(min=0, max=max(n_blocks - 1, 0)).long()
+        valid_p2b = (
+            (pin_raw >= 0) & (block_raw >= 0)
+            & (pin_raw < n_pins) & (block_raw < n_blocks)
+            & block_mask.gather(1, block_idx)
+        )
+        pin_x = pins_pos[:, :, 0].gather(1, pin_idx)
+        pin_y = pins_pos[:, :, 1].gather(1, pin_idx)
+        dx = torch.abs(cx.gather(1, block_idx) - pin_x)
+        dy = torch.abs(cy.gather(1, block_idx) - pin_y)
+        weight = p2b_connectivity[:, :, 2].to(dtype=positions.dtype)
+        hpwl_p2b = (weight * (dx + dy) * valid_p2b.to(dtype=positions.dtype)).sum(dim=1)
+
+    hpwl_total = hpwl_b2b + hpwl_p2b
+
+    # Bounding box area while ignoring padded rows.
+    fill_value = torch.finfo(positions.dtype).max / 4
+    x_min = x.masked_fill(~block_mask, fill_value).min(dim=1).values
+    y_min = y.masked_fill(~block_mask, fill_value).min(dim=1).values
+    x_max = (x + w).masked_fill(~block_mask, -fill_value).max(dim=1).values
+    y_max = (y + h).masked_fill(~block_mask, -fill_value).max(dim=1).values
+    bbox_area = (x_max - x_min) * (y_max - y_min)
+
+    # Pairwise overlap, vectorized over the upper triangle.
+    right = x + w
+    top = y + h
+    overlap_x = torch.relu(
+        torch.minimum(right.unsqueeze(2), right.unsqueeze(1))
+        - torch.maximum(x.unsqueeze(2), x.unsqueeze(1))
+    )
+    overlap_y = torch.relu(
+        torch.minimum(top.unsqueeze(2), top.unsqueeze(1))
+        - torch.maximum(y.unsqueeze(2), y.unsqueeze(1))
+    )
+    pair_mask = block_mask.unsqueeze(2) & block_mask.unsqueeze(1)
+    upper_triangle = torch.triu(
+        torch.ones(n_blocks, n_blocks, device=positions.device, dtype=torch.bool),
+        diagonal=1,
+    )
+    overlap_area = (
+        overlap_x
+        * overlap_y
+        * pair_mask.to(dtype=positions.dtype)
+        * upper_triangle.to(dtype=positions.dtype)
+    ).sum(dim=(1, 2))
+
+    # Normalize by total block area
+    total_block_area = (w * h).masked_fill(~block_mask, 0).sum(dim=1)
+    overlap_violation = overlap_area / (total_block_area + 1e-6)
+
+    # Area tolerance violation.
+    actual_areas = w * h
+    valid_mask = area_targets > 0
+    safe_targets = area_targets.clamp_min(1e-6)
+    area_errors = torch.where(
+        valid_mask,
+        torch.abs(actual_areas - area_targets) / safe_targets,
+        torch.zeros_like(area_targets),
+    )
+    tolerance = AREA_TOLERANCE  # 0.01
+    area_excess = torch.relu(area_errors - tolerance)
+    area_violation = area_excess.sum(dim=1) / (valid_mask.sum(dim=1).to(positions.dtype) + 1e-6)
+
+    # Gaps vs. baseline metrics:
+    # [area, num_pins, num_total_nets, num_b2b_nets, num_p2b_nets,
+    #  num_hardconstraints, b2b_weighted_wl, p2b_weighted_wl]
+    baseline_area = baseline_metrics[:, 0]
+    baseline_hpwl = baseline_metrics[:, 6] + baseline_metrics[:, 7]
+
+    hpwl_gap = torch.relu((hpwl_total - baseline_hpwl) / (baseline_hpwl + 1e-6))
+    area_gap = torch.relu((bbox_area - baseline_area) / (baseline_area + 1e-6))
+
+    V_soft = overlap_violation + area_violation
+    quality_factor = 1 + ALPHA * (hpwl_gap + area_gap)
+    violation_factor = torch.exp(BETA * V_soft)
+
+    return quality_factor * violation_factor
+
+
 def compute_training_loss_differentiable(
     positions: torch.Tensor,
     b2b_connectivity: torch.Tensor,
@@ -1271,138 +1437,22 @@ def compute_training_loss_differentiable(
 ) -> torch.Tensor:
     """
     Compute contest evaluation score in DIFFERENTIABLE form.
-    
+
     This is the SAME formula as contest evaluation, but using differentiable
     operations so gradients can flow through for neural network training.
-    
-    Cost = (1 + α·(HPWL_gap + Area_gap)) × exp(β·V_soft)
-    
-    Where V_soft is a differentiable proxy for violations:
-    - Overlap: sum of pairwise overlap areas (normalized)
-    - Area tolerance: soft penalty when outside 1% tolerance
-    
-    Args:
-        positions: Tensor [N, 4] of (x, y, w, h) for each block
-        b2b_connectivity: Block-to-block edges [E, 3] = (block_i, block_j, weight)
-        p2b_connectivity: Pin-to-block edges [E, 3] = (pin_i, block_j, weight)
-        pins_pos: Pin positions [P, 2]
-        area_targets: Target areas [N]
-        baseline_metrics: Ground truth metrics [8] from training data
-                         [area, num_pins, num_nets, ..., b2b_wl, p2b_wl]
-        constraints: Optional placement constraints [N, 5]
-    
-    Returns:
-        Differentiable loss tensor (scalar) - can call .backward()
-    
-    Example:
-        positions = model(inputs)  # [N, 4] tensor
-        loss = compute_training_loss_differentiable(
-            positions, b2b_conn, p2b_conn, pins_pos, area_targets, metrics
-        )
-        loss.backward()  # Gradients flow!
+    The implementation uses vectorized tensor operations and returns a scalar
+    for the common single-sample call.
     """
-    N = positions.shape[0]
-    
-    # Unpack positions: [x, y, w, h]
-    x = positions[:, 0]
-    y = positions[:, 1]
-    w = positions[:, 2]
-    h = positions[:, 3]
-    
-    # Compute centroids
-    cx = x + w / 2
-    cy = y + h / 2
-    
-    # =========================================================================
-    # 1. HPWL (Half-Perimeter Wirelength) - Differentiable
-    # =========================================================================
-    hpwl_b2b = torch.tensor(0.0, device=positions.device, dtype=positions.dtype)
-    valid_b2b = b2b_connectivity[b2b_connectivity[:, 0] >= 0]
-    for edge in valid_b2b:
-        i, j, weight = int(edge[0]), int(edge[1]), edge[2]
-        if i < N and j < N:
-            dx = torch.abs(cx[i] - cx[j])
-            dy = torch.abs(cy[i] - cy[j])
-            hpwl_b2b = hpwl_b2b + weight * (dx + dy)
-    
-    hpwl_p2b = torch.tensor(0.0, device=positions.device, dtype=positions.dtype)
-    valid_p2b = p2b_connectivity[p2b_connectivity[:, 0] >= 0]
-    for edge in valid_p2b:
-        pin_idx, block_idx, weight = int(edge[0]), int(edge[1]), edge[2]
-        if pin_idx < pins_pos.shape[0] and block_idx < N:
-            pin_x, pin_y = pins_pos[pin_idx, 0], pins_pos[pin_idx, 1]
-            dx = torch.abs(cx[block_idx] - pin_x)
-            dy = torch.abs(cy[block_idx] - pin_y)
-            hpwl_p2b = hpwl_p2b + weight * (dx + dy)
-    
-    hpwl_total = hpwl_b2b + hpwl_p2b
-    
-    # =========================================================================
-    # 2. Bounding Box Area - Differentiable
-    # =========================================================================
-    x_min = x.min()
-    y_min = y.min()
-    x_max = (x + w).max()
-    y_max = (y + h).max()
-    bbox_area = (x_max - x_min) * (y_max - y_min)
-    
-    # =========================================================================
-    # 3. Overlap Violation (Differentiable) - Sum of overlap areas
-    # =========================================================================
-    overlap_area = torch.tensor(0.0, device=positions.device, dtype=positions.dtype)
-    for i in range(N):
-        for j in range(i + 1, N):
-            # Overlap dimensions (clamped to 0 with ReLU for differentiability)
-            xi1, yi1, wi, hi = x[i], y[i], w[i], h[i]
-            xj1, yj1, wj, hj = x[j], y[j], w[j], h[j]
-            
-            overlap_x = torch.relu(torch.min(xi1 + wi, xj1 + wj) - torch.max(xi1, xj1))
-            overlap_y = torch.relu(torch.min(yi1 + hi, yj1 + hj) - torch.max(yi1, yj1))
-            overlap_area = overlap_area + overlap_x * overlap_y
-    
-    # Normalize by total block area
-    total_block_area = (w * h).sum()
-    overlap_violation = overlap_area / (total_block_area + 1e-6)
-    
-    # =========================================================================
-    # 4. Area Tolerance Violation (Differentiable) - Soft penalty
-    # =========================================================================
-    actual_areas = w * h
-    valid_mask = area_targets > 0
-    area_errors = torch.zeros_like(area_targets)
-    area_errors[valid_mask] = torch.abs(actual_areas[valid_mask] - area_targets[valid_mask]) / area_targets[valid_mask]
-    
-    # Soft hinge: penalty only when exceeding 1% tolerance
-    tolerance = AREA_TOLERANCE  # 0.01
-    area_excess = torch.relu(area_errors - tolerance)
-    area_violation = area_excess.sum() / (valid_mask.sum() + 1e-6)
-    
-    # =========================================================================
-    # 5. Compute Gaps vs Baseline
-    # =========================================================================
-    # baseline_metrics: [area, num_pins, num_total_nets, num_b2b_nets, num_p2b_nets, 
-    #                    num_hardconstraints, b2b_weighted_wl, p2b_weighted_wl]
-    baseline_area = baseline_metrics[0]
-    baseline_hpwl = baseline_metrics[6] + baseline_metrics[7]
-    
-    hpwl_gap = torch.relu((hpwl_total - baseline_hpwl) / (baseline_hpwl + 1e-6))
-    area_gap = torch.relu((bbox_area - baseline_area) / (baseline_area + 1e-6))
-    
-    # =========================================================================
-    # 6. Combined Violation (Differentiable proxy for V_rel)
-    # =========================================================================
-    V_soft = overlap_violation + area_violation
-    
-    # =========================================================================
-    # 7. Contest Cost Formula (Differentiable)
-    # Cost = (1 + α·(HPWL_gap + Area_gap)) × exp(β·V_soft)
-    # =========================================================================
-    quality_factor = 1 + ALPHA * (hpwl_gap + area_gap)
-    violation_factor = torch.exp(BETA * V_soft)
-    
-    cost = quality_factor * violation_factor
-    
-    return cost
+    losses = compute_training_loss_differentiable_batch(
+        positions,
+        b2b_connectivity,
+        p2b_connectivity,
+        pins_pos,
+        area_targets,
+        baseline_metrics,
+        constraints=constraints,
+    )
+    return losses.mean() if positions.dim() == 3 else losses[0]
 
 
 def compute_training_loss_batch(
