@@ -1,0 +1,27 @@
+# Local agent/session metadata
+.agents/
+.codex/
+
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# FloorSet data and generated artifacts
+LiteTensorData/
+LiteTensorDataTest/
+checkpoints/
+*.pth
+*_solutions.json
+baselines.json
+*.png
+*.svg
+*.pdf.txt
+
+# Local environment files
+.env
+.env.*
