@@ -44,13 +44,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # Add parent directory for imports
-
-current_dir = Path(__file__).resolve().parent.parent
-
-print(current_dir) 
-sys.path.insert(0, str(current_dir))
-
-#sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from litetestLoader import FloorplanDatasetLiteTest, floorplan_collate as test_floorplan_collate
 from liteLoader import FloorplanDatasetLite  # Training data (1M samples)

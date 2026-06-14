@@ -25,3 +25,7 @@ baselines.json
 # Local environment files
 .env
 .env.*
+iccad2026contest/checkpoints/
+data_lite/
+floorset_lite/
+**/__pycache__/
