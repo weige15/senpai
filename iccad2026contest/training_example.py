@@ -61,7 +61,7 @@ class NetlistGNN(nn.Module):
         if edges.numel() > 0:
             idx_i = edges[:, 0].long()
             idx_j = edges[:, 1].long()
-            weight = edges[:, 2].unsqueeze(-1)
+            weight = edges[:, 2].to(dtype=h.dtype).unsqueeze(-1)
             
             msg_to_i = h[idx_j] * weight
             msg_to_j = h[idx_i] * weight
@@ -554,7 +554,7 @@ def main():
         start_batch_idx = resume_global_step % len(dataloader)
         global_step = resume_global_step
         amp_enabled = args.amp and device.type == "cuda"
-        scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+        scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled)
 
         for epoch in range(start_epoch, args.epochs + 1):
             log_main(rank, f"Starting Epoch {epoch}/{args.epochs}")
@@ -574,7 +574,7 @@ def main():
                 batch = [tensor.to(device, non_blocking=True) for tensor in batch]
                 optimizer.zero_grad(set_to_none=True)
 
-                with torch.cuda.amp.autocast(enabled=amp_enabled):
+                with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
                     losses = []
                     for sample_idx in range(batch[0].shape[0]):
                         loss = compute_sample_loss(
