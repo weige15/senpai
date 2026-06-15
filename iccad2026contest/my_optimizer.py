@@ -11,6 +11,7 @@ ICCAD 2026 FloorSet Challenge - Edge-GNN + DiT-Small + Hybrid B*-tree Contour Le
 
 import math
 import random
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1359,6 +1360,72 @@ class BStarTreeLegalizer:
 # =============================================================================
 # 6. 主優化器類別 (MyOptimizer)
 # =============================================================================
+
+def checkpoint_step_from_name(path: Path) -> int:
+    step_match = re.search(r"step_(\d+)", path.name)
+    if step_match:
+        return int(step_match.group(1))
+
+    epoch_match = re.search(r"epoch_(\d+)", path.name)
+    if epoch_match:
+        return int(epoch_match.group(1))
+
+    return -1
+
+
+def checkpoint_loss_is_finite(path: Path) -> bool:
+    loss_match = re.search(r"loss_([^_]+)", path.stem)
+    if not loss_match:
+        return True
+    try:
+        return math.isfinite(float(loss_match.group(1)))
+    except ValueError:
+        return True
+
+
+def strip_module_prefix(state_dict):
+    if not any(key.startswith("module.") for key in state_dict):
+        return state_dict
+    return {key.removeprefix("module."): value for key, value in state_dict.items()}
+
+
+def state_dict_is_finite(state_dict) -> bool:
+    for value in state_dict.values():
+        if (
+            torch.is_tensor(value)
+            and (value.is_floating_point() or value.is_complex())
+            and not torch.isfinite(value).all().item()
+        ):
+            return False
+    return True
+
+
+def load_latest_finite_checkpoint(model, weight_path: Path, device, verbose: bool = False):
+    if not weight_path.exists():
+        return None
+
+    candidates = [
+        path for path in weight_path.glob("*.pth")
+        if checkpoint_loss_is_finite(path)
+    ]
+    candidates.sort(key=lambda path: (checkpoint_step_from_name(path), path.name), reverse=True)
+
+    for path in candidates:
+        try:
+            state_dict = strip_module_prefix(torch.load(path, map_location=device))
+            if not state_dict_is_finite(state_dict):
+                if verbose:
+                    print(f"--> WARNING: Skipping non-finite checkpoint: {path.name}")
+                continue
+            model.load_state_dict(state_dict, strict=True)
+            return path
+        except Exception as exc:
+            if verbose:
+                print(f"--> WARNING: Skipping unusable checkpoint {path.name}: {exc}")
+
+    return None
+
+
 class MyOptimizer(FloorplanOptimizer):
     def __init__(self, verbose: bool = False):
         super().__init__(verbose)
@@ -1369,17 +1436,19 @@ class MyOptimizer(FloorplanOptimizer):
         
         # 自動尋找最新一輪的 .pth 檔案
         weight_path = Path(__file__).parent / "checkpoints"
-        latest_weight = list(weight_path.glob("*.pth")) if weight_path.exists() else []
-        self.checkpoint_loaded = bool(latest_weight)
-        if latest_weight:
-            # 排序抓取最新的一顆權重
-            latest_weight.sort()
-            self.model.load_state_dict(torch.load(latest_weight[-1], map_location=self.device), strict=True)
+        latest_weight = load_latest_finite_checkpoint(
+            self.model,
+            weight_path,
+            self.device,
+            verbose=self.verbose,
+        )
+        self.checkpoint_loaded = latest_weight is not None
+        if latest_weight is not None:
             if self.verbose:
-                print(f"--> [A100 GPU] Successfully loaded Edge-GNN + DiT Checkpoint: {latest_weight[-1].name}")
+                print(f"--> [A100 GPU] Successfully loaded Edge-GNN + DiT Checkpoint: {latest_weight.name}")
         else:
             if self.verbose:
-                print("--> WARNING: No weights found in checkpoints/. Using deterministic guidance fallback.")
+                print("--> WARNING: No usable finite weights found in checkpoints/. Using deterministic guidance fallback.")
                 
         self.model.to(self.device)
         self.model.eval() # 🚀 關閉 Dropout, 進入高效推論模式

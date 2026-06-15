@@ -340,6 +340,12 @@ def parse_args():
         default=1.0,
         help="Max gradient norm before optimizer step. Use 0 to disable.",
     )
+    parser.add_argument(
+        "--max-loss",
+        type=float,
+        default=100.0,
+        help="Skip optimizer step when finite loss exceeds this value. Use 0 to disable.",
+    )
     parser.add_argument("--max-blocks", type=int, default=1000)
     parser.add_argument("--save-freq-batches", type=int, default=10)
     parser.add_argument("--log-freq", type=int, default=1)
@@ -470,14 +476,28 @@ def checkpoint_step_from_name(path: Path, steps_per_epoch: int) -> int:
     return -1
 
 
-def find_latest_checkpoint(checkpoint_folder: Path, steps_per_epoch: int):
+def checkpoint_loss_is_finite(path: Path) -> bool:
+    loss_match = re.search(r"loss_([^_]+)", path.stem)
+    if not loss_match:
+        return True
+    try:
+        return math.isfinite(float(loss_match.group(1)))
+    except ValueError:
+        return True
+
+
+def find_latest_checkpoint(checkpoint_folder: Path, steps_per_epoch: int, before_step=None):
     if checkpoint_folder.exists():
         pth_files = list(checkpoint_folder.glob("*.pth"))
         if pth_files:
             latest_pth = None
             max_step_found = -1
             for pth in pth_files:
+                if not checkpoint_loss_is_finite(pth):
+                    continue
                 step = checkpoint_step_from_name(pth, steps_per_epoch)
+                if before_step is not None and step >= before_step:
+                    continue
                 if step > max_step_found:
                     max_step_found = step
                     latest_pth = pth
@@ -492,9 +512,38 @@ def strip_module_prefix(state_dict):
     return {key.removeprefix("module."): value for key, value in state_dict.items()}
 
 
-def save_checkpoint(model, save_path: Path):
+def state_dict_is_finite(state_dict) -> bool:
+    for value in state_dict.values():
+        if (
+            torch.is_tensor(value)
+            and (value.is_floating_point() or value.is_complex())
+            and not torch.isfinite(value).all().item()
+        ):
+            return False
+    return True
+
+
+def raw_model_for_checkpoint(model):
     raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-    torch.save(raw_model.state_dict(), save_path)
+    return raw_model
+
+
+def model_state_is_finite(model) -> bool:
+    return state_dict_is_finite(raw_model_for_checkpoint(model).state_dict())
+
+
+def model_gradients_are_finite(model) -> bool:
+    for param in raw_model_for_checkpoint(model).parameters():
+        if param.grad is not None and not torch.isfinite(param.grad).all().item():
+            return False
+    return True
+
+
+def save_checkpoint(model, save_path: Path):
+    state_dict = raw_model_for_checkpoint(model).state_dict()
+    if not state_dict_is_finite(state_dict):
+        raise FloatingPointError(f"Refusing to save non-finite checkpoint: {save_path}")
+    torch.save(state_dict, save_path)
 
 
 def set_scheduler_step(scheduler, optimizer, lr_lambda, global_step: int):
@@ -511,6 +560,21 @@ def reduce_mean(value: torch.Tensor, distributed: bool, world_size: int):
         value /= world_size
         return value
     return value.detach()
+
+
+def all_ranks_true(local_value: bool, device, distributed: bool) -> bool:
+    flag = torch.tensor(1 if local_value else 0, device=device, dtype=torch.int32)
+    if distributed:
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    return bool(flag.item())
+
+
+def loss_is_acceptable(loss: torch.Tensor, max_loss: float) -> bool:
+    if not torch.isfinite(loss).all().item():
+        return False
+    if max_loss > 0 and abs(float(loss.detach().item())) > max_loss:
+        return False
+    return True
 
 
 def compute_sample_loss(model, batch, sample_idx: int, device, max_blocks: int, noise_std: float):
@@ -653,13 +717,27 @@ def main():
         checkpoint_folder = Path(args.checkpoint_dir).expanduser()
         latest_pth, resume_global_step = find_latest_checkpoint(checkpoint_folder, len(dataloader))
 
-        if latest_pth is not None:
+        loaded_checkpoint = False
+        while latest_pth is not None:
             log_main(rank, "[Auto-Resume] Found historical weights in checkpoint directory.")
-            log_main(rank, f"[Auto-Resume] Loading latest progress: '{latest_pth.name}'")
-            state_dict = torch.load(latest_pth, map_location=device)
-            model.load_state_dict(strip_module_prefix(state_dict), strict=True)
-            log_main(rank, f"[Auto-Resume] Resuming from Global Step: {resume_global_step}\n")
-        else:
+            log_main(rank, f"[Auto-Resume] Checking checkpoint: '{latest_pth.name}'")
+            state_dict = strip_module_prefix(torch.load(latest_pth, map_location=device))
+            if state_dict_is_finite(state_dict):
+                model.load_state_dict(state_dict, strict=True)
+                loaded_checkpoint = True
+                log_main(rank, f"[Auto-Resume] Loaded checkpoint: '{latest_pth.name}'")
+                log_main(rank, f"[Auto-Resume] Resuming from Global Step: {resume_global_step}\n")
+                break
+
+            log_main(rank, f"[Auto-Resume] Skipping non-finite checkpoint: '{latest_pth.name}'")
+            latest_pth, resume_global_step = find_latest_checkpoint(
+                checkpoint_folder,
+                len(dataloader),
+                before_step=resume_global_step,
+            )
+
+        if not loaded_checkpoint:
+            resume_global_step = 0
             log_main(rank, "[Auto-Resume] No usable checkpoint found. Starting from scratch.")
 
         if distributed:
@@ -722,11 +800,40 @@ def main():
                     if batch_loss is None:
                         continue
 
+                local_loss_ok = loss_is_acceptable(batch_loss, args.max_loss)
+                if not all_ranks_true(local_loss_ok, device, distributed):
+                    loss_value = (
+                        float(batch_loss.detach().item())
+                        if torch.isfinite(batch_loss).all().item()
+                        else float("nan")
+                    )
+                    log_main(
+                        rank,
+                        f"  Batch [{batch_idx + 1}/{len(dataloader)}] skipped: "
+                        f"non-finite or runaway loss ({loss_value:.4f})",
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+
                 scaler.scale(batch_loss).backward()
+                grad_norm = None
                 if args.grad_clip > 0:
                     if amp_enabled:
                         scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
+                local_grad_ok = True
+                if grad_norm is not None:
+                    local_grad_ok = torch.isfinite(grad_norm).all().item()
+                else:
+                    local_grad_ok = model_gradients_are_finite(model)
+                if not all_ranks_true(local_grad_ok, device, distributed):
+                    log_main(
+                        rank,
+                        f"  Batch [{batch_idx + 1}/{len(dataloader)}] skipped: non-finite gradients",
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
 
                 scale_before_step = scaler.get_scale() if amp_enabled else None
                 scaler.step(optimizer)
@@ -752,6 +859,10 @@ def main():
                     )
 
                 if args.save_freq_batches > 0 and global_step % args.save_freq_batches == 0:
+                    if not all_ranks_true(model_state_is_finite(model), device, distributed):
+                        raise FloatingPointError(
+                            "Model parameters became non-finite; restart from the last finite checkpoint."
+                        )
                     if is_main_process(rank):
                         log_loss_value = log_loss.item()
                         checkpoint_folder.mkdir(exist_ok=True, parents=True)
@@ -763,6 +874,11 @@ def main():
             if processed_batches > 0:
                 avg_epoch_loss = (epoch_loss / processed_batches).item()
                 log_main(rank, f"Epoch {epoch} Completed. Average Loss: {avg_epoch_loss:.4f}")
+
+            if not all_ranks_true(model_state_is_finite(model), device, distributed):
+                raise FloatingPointError(
+                    "Model parameters became non-finite; restart from the last finite checkpoint."
+                )
 
             if is_main_process(rank):
                 checkpoint_folder.mkdir(exist_ok=True, parents=True)
