@@ -1101,6 +1101,11 @@ class FeasibleFallbackPacker:
 
 
 class SoftConstraintImprover:
+    BOUNDARY_EPS = 1e-6
+    ROUND_DIGITS = 9
+    MAX_AXIS_OPTIONS = 8
+    PROXY_EPS = 1e-12
+
     @classmethod
     def improve(
         cls,
@@ -1108,9 +1113,435 @@ class SoftConstraintImprover:
         placement: List[Tuple[float, float, float, float]],
         checker: Optional[object] = None,
     ) -> List[Tuple[float, float, float, float]]:
-        # Boundary, grouping, and MIB moves stay disabled until checker-backed
-        # move acceptance is implemented. A copy keeps this stage mutation-free.
-        return [tuple(rect) for rect in placement]
+        best = [tuple(rect) for rect in placement]
+        active_checker = checker if checker is not None else FeasibilityChecker()
+        if not active_checker.check(best, problem).is_feasible:
+            return best
+
+        current_boundary = cls._boundary_violations(problem, best)
+        if current_boundary == 0:
+            return best
+
+        current_soft = cls._soft_violations(problem, best)
+        n_soft = cls._soft_denominator(problem)
+        current_hpwl = cls._hpwl(problem, best)
+        current_area = max(calculate_bbox_area(best), 1.0)
+        current_proxy = cls._cost_proxy(
+            current_soft,
+            n_soft,
+            hpwl=current_hpwl,
+            area=current_area,
+            hpwl_baseline=max(current_hpwl, 1.0),
+            area_baseline=current_area,
+        )
+
+        for block in problem.blocks:
+            if block.is_preplaced or block.boundary_mask == 0:
+                continue
+
+            candidate_choice: Optional[List[Tuple[float, float, float, float]]] = None
+            candidate_choice_key: Optional[Tuple[float, float, float, float, int]] = None
+
+            for rect in cls._boundary_candidates(problem, best, block):
+                if cls._same_rect(rect, best[block.index]):
+                    continue
+                if cls._overlaps_any(block.index, rect, best):
+                    continue
+
+                candidate = list(best)
+                candidate[block.index] = rect
+                candidate_boundary = cls._boundary_violations(problem, candidate)
+                if candidate_boundary >= current_boundary:
+                    continue
+                candidate_soft = cls._soft_violations(problem, candidate)
+                if candidate_soft >= current_soft:
+                    continue
+
+                report = active_checker.check(candidate, problem)
+                if not report.is_feasible:
+                    continue
+
+                candidate_hpwl = cls._hpwl(problem, candidate)
+                candidate_area = max(calculate_bbox_area(candidate), 1.0)
+                candidate_proxy = cls._cost_proxy(
+                    candidate_soft,
+                    n_soft,
+                    hpwl=candidate_hpwl,
+                    area=candidate_area,
+                    hpwl_baseline=max(current_hpwl, 1.0),
+                    area_baseline=current_area,
+                )
+                if candidate_proxy > current_proxy + cls.PROXY_EPS:
+                    continue
+
+                candidate_key = (
+                    round(candidate_proxy, cls.ROUND_DIGITS),
+                    float(candidate_soft),
+                    float(candidate_boundary),
+                    round(candidate_hpwl, cls.ROUND_DIGITS),
+                    round(candidate_area, cls.ROUND_DIGITS),
+                    block.index,
+                )
+                if candidate_choice_key is None or candidate_key < candidate_choice_key:
+                    candidate_choice_key = candidate_key
+                    candidate_choice = candidate
+
+            if candidate_choice is not None and candidate_choice_key is not None:
+                best = candidate_choice
+                current_soft = int(candidate_choice_key[1])
+                current_boundary = int(candidate_choice_key[2])
+                current_hpwl = cls._hpwl(problem, best)
+                current_area = max(calculate_bbox_area(best), 1.0)
+                current_proxy = cls._cost_proxy(
+                    current_soft,
+                    n_soft,
+                    hpwl=current_hpwl,
+                    area=current_area,
+                    hpwl_baseline=max(current_hpwl, 1.0),
+                    area_baseline=current_area,
+                )
+                if current_boundary == 0:
+                    break
+
+        return best
+
+    @classmethod
+    def _boundary_candidates(
+        cls,
+        problem: NormalizedProblem,
+        positions: List[Tuple[float, float, float, float]],
+        block: BlockSpec,
+    ) -> List[Tuple[float, float, float, float]]:
+        bbox = cls._bbox(positions)
+        if bbox is None:
+            return []
+
+        x, y, width, height = positions[block.index]
+        min_x, min_y, max_x, max_y = bbox
+        x_options = cls._required_axis_options(
+            block.boundary_mask,
+            low_bit=1,
+            high_bit=2,
+            low_value=min_x,
+            high_value=max_x - width,
+            current_value=x,
+        )
+        y_options = cls._required_axis_options(
+            block.boundary_mask,
+            low_bit=8,
+            high_bit=4,
+            low_value=min_y,
+            high_value=max_y - height,
+            current_value=y,
+        )
+
+        has_horizontal = bool(block.boundary_mask & (1 | 2))
+        has_vertical = bool(block.boundary_mask & (4 | 8))
+        if has_horizontal and not has_vertical:
+            y_options = cls._free_axis_options(
+                block.index,
+                positions,
+                axis=1,
+                size=height,
+                low=min_y,
+                high=max_y - height,
+                current=y,
+            )
+        elif has_vertical and not has_horizontal:
+            x_options = cls._free_axis_options(
+                block.index,
+                positions,
+                axis=0,
+                size=width,
+                low=min_x,
+                high=max_x - width,
+                current=x,
+            )
+
+        candidates: List[Tuple[float, float, float, float]] = []
+        seen = set()
+        for cand_x in x_options:
+            for cand_y in y_options:
+                if not math.isfinite(cand_x) or not math.isfinite(cand_y):
+                    continue
+                rect = (float(cand_x), float(cand_y), float(width), float(height))
+                key = (
+                    round(rect[0], cls.ROUND_DIGITS),
+                    round(rect[1], cls.ROUND_DIGITS),
+                    round(rect[2], cls.ROUND_DIGITS),
+                    round(rect[3], cls.ROUND_DIGITS),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(rect)
+        return candidates
+
+    @classmethod
+    def _required_axis_options(
+        cls,
+        mask: int,
+        low_bit: int,
+        high_bit: int,
+        low_value: float,
+        high_value: float,
+        current_value: float,
+    ) -> List[float]:
+        options: List[float] = []
+        if mask & low_bit:
+            options.append(low_value)
+        if mask & high_bit:
+            options.append(high_value)
+        if not options:
+            options.append(current_value)
+        return cls._unique_values(options)
+
+    @classmethod
+    def _free_axis_options(
+        cls,
+        block_id: int,
+        positions: List[Tuple[float, float, float, float]],
+        axis: int,
+        size: float,
+        low: float,
+        high: float,
+        current: float,
+    ) -> List[float]:
+        if high < low:
+            return [current]
+
+        options = [current, low, high]
+        for other_id, rect in enumerate(positions):
+            if other_id == block_id:
+                continue
+            start = rect[axis]
+            other_size = rect[2] if axis == 0 else rect[3]
+            end = start + other_size
+            options.append(end)
+            options.append(start - size)
+
+        bounded = [
+            value for value in cls._unique_values(options)
+            if math.isfinite(value) and value >= low - cls.BOUNDARY_EPS and value <= high + cls.BOUNDARY_EPS
+        ]
+        bounded.sort(key=lambda value: (abs(value - current), value))
+        return bounded[:cls.MAX_AXIS_OPTIONS] or [current]
+
+    @classmethod
+    def _boundary_violations(
+        cls,
+        problem: NormalizedProblem,
+        positions: List[Tuple[float, float, float, float]],
+    ) -> int:
+        bbox = cls._bbox(positions)
+        if bbox is None:
+            return 0
+
+        min_x, min_y, max_x, max_y = bbox
+        violations = 0
+        for block in problem.blocks:
+            code = int(block.boundary_mask)
+            if code == 0:
+                continue
+            x, y, width, height = positions[block.index]
+            touches = {
+                1: abs(x - min_x) < cls.BOUNDARY_EPS,
+                2: abs(x + width - max_x) < cls.BOUNDARY_EPS,
+                4: abs(y + height - max_y) < cls.BOUNDARY_EPS,
+                8: abs(y - min_y) < cls.BOUNDARY_EPS,
+            }
+            if not all(touches[bit] for bit in (1, 2, 4, 8) if code & bit):
+                violations += 1
+        return violations
+
+    @classmethod
+    def _soft_violations(
+        cls,
+        problem: NormalizedProblem,
+        positions: List[Tuple[float, float, float, float]],
+    ) -> int:
+        return (
+            cls._boundary_violations(problem, positions)
+            + cls._grouping_violations(problem, positions)
+            + cls._mib_violations(problem, positions)
+        )
+
+    @classmethod
+    def _grouping_violations(
+        cls,
+        problem: NormalizedProblem,
+        positions: List[Tuple[float, float, float, float]],
+    ) -> int:
+        groups: Dict[int, List[int]] = {}
+        for block in problem.blocks:
+            if block.cluster_group is None:
+                continue
+            groups.setdefault(block.cluster_group, []).append(block.index)
+
+        violations = 0
+        for group_indices in groups.values():
+            if len(group_indices) <= 1:
+                continue
+            components = cls._edge_connected_components(group_indices, positions)
+            violations += max(0, components - 1)
+        return violations
+
+    @classmethod
+    def _edge_connected_components(
+        cls,
+        group_indices: List[int],
+        positions: List[Tuple[float, float, float, float]],
+    ) -> int:
+        remaining = set(group_indices)
+        components = 0
+
+        while remaining:
+            components += 1
+            stack = [remaining.pop()]
+            while stack:
+                current = stack.pop()
+                for other in list(remaining):
+                    if cls._share_edge(positions[current], positions[other]):
+                        remaining.remove(other)
+                        stack.append(other)
+        return components
+
+    @classmethod
+    def _share_edge(
+        cls,
+        first: Tuple[float, float, float, float],
+        second: Tuple[float, float, float, float],
+    ) -> bool:
+        x1, y1, w1, h1 = first
+        x2, y2, w2, h2 = second
+        first_right = x1 + w1
+        second_right = x2 + w2
+        first_top = y1 + h1
+        second_top = y2 + h2
+
+        y_overlap = min(first_top, second_top) - max(y1, y2)
+        x_overlap = min(first_right, second_right) - max(x1, x2)
+        vertical_touch = (
+            abs(first_right - x2) < cls.BOUNDARY_EPS
+            or abs(second_right - x1) < cls.BOUNDARY_EPS
+        )
+        horizontal_touch = (
+            abs(first_top - y2) < cls.BOUNDARY_EPS
+            or abs(second_top - y1) < cls.BOUNDARY_EPS
+        )
+        return (
+            vertical_touch and y_overlap > cls.BOUNDARY_EPS
+        ) or (
+            horizontal_touch and x_overlap > cls.BOUNDARY_EPS
+        )
+
+    @staticmethod
+    def _mib_violations(
+        problem: NormalizedProblem,
+        positions: List[Tuple[float, float, float, float]],
+    ) -> int:
+        groups: Dict[int, List[int]] = {}
+        for block in problem.blocks:
+            if block.mib_group is None:
+                continue
+            groups.setdefault(block.mib_group, []).append(block.index)
+
+        violations = 0
+        for group_indices in groups.values():
+            distinct_shapes = {
+                (round(positions[index][2], 4), round(positions[index][3], 4))
+                for index in group_indices
+            }
+            violations += max(0, len(distinct_shapes) - 1)
+        return violations
+
+    @staticmethod
+    def _soft_denominator(problem: NormalizedProblem) -> int:
+        total = sum(1 for block in problem.blocks if block.boundary_mask != 0)
+
+        mib_groups: Dict[int, int] = {}
+        cluster_groups: Dict[int, int] = {}
+        for block in problem.blocks:
+            if block.mib_group is not None:
+                mib_groups[block.mib_group] = mib_groups.get(block.mib_group, 0) + 1
+            if block.cluster_group is not None:
+                cluster_groups[block.cluster_group] = cluster_groups.get(block.cluster_group, 0) + 1
+
+        total += sum(max(0, size - 1) for size in mib_groups.values())
+        total += sum(max(0, size - 1) for size in cluster_groups.values())
+        return max(total, 1)
+
+    @staticmethod
+    def _hpwl(
+        problem: NormalizedProblem,
+        positions: List[Tuple[float, float, float, float]],
+    ) -> float:
+        return (
+            calculate_hpwl_b2b(positions, problem.b2b_connectivity)
+            + calculate_hpwl_p2b(positions, problem.p2b_connectivity, problem.pins_pos)
+        )
+
+    @staticmethod
+    def _cost_proxy(
+        soft_violations: int,
+        n_soft: int,
+        hpwl: float,
+        area: float,
+        hpwl_baseline: float,
+        area_baseline: float,
+    ) -> float:
+        hpwl_gap = max(0.0, hpwl / max(hpwl_baseline, 1.0) - 1.0)
+        area_gap = max(0.0, area / max(area_baseline, 1.0) - 1.0)
+        soft_relative = soft_violations / max(n_soft, 1)
+        return (1.0 + 0.5 * (hpwl_gap + area_gap)) * math.exp(2.0 * soft_relative)
+
+    @classmethod
+    def _overlaps_any(
+        cls,
+        block_id: int,
+        rect: Tuple[float, float, float, float],
+        positions: List[Tuple[float, float, float, float]],
+    ) -> bool:
+        for other_id, other in enumerate(positions):
+            if other_id == block_id:
+                continue
+            if FeasibilityChecker.rectangles_overlap(rect, other):
+                return True
+        return False
+
+    @staticmethod
+    def _bbox(
+        positions: List[Tuple[float, float, float, float]],
+    ) -> Optional[Tuple[float, float, float, float]]:
+        if not positions:
+            return None
+        min_x = min(rect[0] for rect in positions)
+        min_y = min(rect[1] for rect in positions)
+        max_x = max(rect[0] + rect[2] for rect in positions)
+        max_y = max(rect[1] + rect[3] for rect in positions)
+        return (min_x, min_y, max_x, max_y)
+
+    @classmethod
+    def _same_rect(
+        cls,
+        first: Tuple[float, float, float, float],
+        second: Tuple[float, float, float, float],
+    ) -> bool:
+        return all(abs(first[i] - second[i]) < cls.BOUNDARY_EPS for i in range(4))
+
+    @classmethod
+    def _unique_values(cls, values: List[float]) -> List[float]:
+        seen = set()
+        unique: List[float] = []
+        for value in values:
+            if not math.isfinite(value):
+                continue
+            key = round(float(value), cls.ROUND_DIGITS)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(float(value))
+        return unique
 
 
 # =============================================================================

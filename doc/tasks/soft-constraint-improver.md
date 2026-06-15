@@ -26,16 +26,16 @@ Depends on `HardConstraintNormalizer` soft annotations and `FeasibilityChecker`.
 ## Tasks
 
 - [x] Implement `improve(...)` as a hard-feasibility-preserving no-op first if boundary/grouping/MIB move rules are not yet clear.
-- [ ] If boundary improvement is implemented, generate translations for non-preplaced blocks with boundary masks using the current bounding box.
-- [x] Reject any candidate move that changes dimensions, moves a preplaced block, or overlaps another block. No-op implementation emits and accepts no candidate moves; checked boundary moves are deferred.
-- [x] Run `FeasibilityChecker.check(...)` on the full placement before accepting any soft move. No soft move is accepted in the no-op implementation.
+- [x] If boundary improvement is implemented, generate translations for non-preplaced blocks with boundary masks using the current bounding box.
+- [x] Reject any candidate move that changes dimensions, moves a preplaced block, or overlaps another block.
+- [x] Run `FeasibilityChecker.check(...)` on the full placement before accepting any soft move.
 - [x] Leave grouping and MIB transformations disabled or explicitly deferred until their exact legality-preserving move rules are defined.
 
 ## Tests and Quality Gates
 
 - [x] Add or run an approved boundary-conflict case where a boundary move would overlap another block and must be rejected.
 - [x] Add or run an approved check confirming a no-op implementation preserves the legalizer placement exactly.
-- [ ] After implementation approval, run `python iccad2026_evaluate.py --evaluate my_optimizer.py --test-id 0`.
+- [x] After implementation approval, run `python iccad2026_evaluate.py --evaluate my_optimizer.py --test-id 0`.
 
 ## Done When
 
