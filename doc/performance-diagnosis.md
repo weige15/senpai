@@ -2,10 +2,10 @@
 
 ## Purpose
 
-Diagnose why `iccad2026contest/eval_full_after_training.json` is still far from the requested score target of `2.0` or below, using the user-provided low-loss checkpoint context:
+Diagnose why `iccad2026contest/eval_full_after_training.json` remains well above the requested target score of `2.0` or below, using the user-provided low-loss checkpoint context:
 
-- Claimed checkpoint path: `iccad2026contest/checkpoints/dit_gnn_step_43299_epoch_11_end.pth`
-- Actual file found locally: `iccad2026contest/dit_gnn_step_43299_epoch_11_end.pth`
+- Checkpoint path provided by user: `iccad2026contest/checkpoints/dit_gnn_step_43299_epoch_11_end.pth`
+- File status: present locally at that path, about 128 MB
 
 No optimizer implementation code was changed during this diagnosis.
 
@@ -14,18 +14,19 @@ No optimizer implementation code was changed during this diagnosis.
 Covered:
 
 - Saved evaluator artifact: `iccad2026contest/eval_full_after_training.json`.
-- Checkpoint inventory under `iccad2026contest/` and `iccad2026contest/checkpoints/`.
-- `iccad2026contest/my_optimizer.py` checkpoint loading, model-guidance adapter, constructive candidate generation, boundary-frame candidate, soft improver, and candidate selector.
+- Checkpoint inventory under `iccad2026contest/checkpoints/`.
+- `iccad2026contest/my_optimizer.py` checkpoint loading, hard normalizer, constructive legalizer, boundary-frame candidate, connection-aware origin scoring, candidate selector, and fallback path.
 - `iccad2026contest/iccad2026_evaluate.py` score formula, hard-feasibility checks, soft-violation normalization, runtime handling, and block-count weighting.
-- `iccad2026contest/training_example.py` checkpoint naming and training-loss path.
-- `noML_optimizer.py` as a read-only reference for candidate families not yet ported into `my_optimizer.py`.
+- `iccad2026contest/training_example.py` and README training-loss notes.
+- `noML_optimizer.py` as a read-only reference for unported candidate families.
 
 Not covered:
 
-- No evaluator command was rerun.
+- No optimizer/evaluator run was executed.
 - No training command was run.
-- No checkpoint was loaded for inspection.
+- No checkpoint tensor was loaded for inspection.
 - No hidden-test behavior was measured.
+- No profiler or memory measurement was run.
 
 ## Source Documents Read
 
@@ -49,40 +50,51 @@ Not covered:
 The saved artifact is hard-feasible:
 
 - `iccad2026contest/eval_full_after_training.json`: 100/100 feasible.
-- Read-only component recomputation over the saved positions and local validation data found:
+- Read-only recomputation of the saved positions with `ContestEvaluator` and `evaluate_solution(...)` found:
   - overlap violations: `0`
   - soft-block area violations: `0`
   - fixed/preplaced dimension or position violations: `0`
-- The evaluator command was not rerun because project rules require approval for evaluator runs.
 
-Checkpoint provenance has an important caveat:
+Correctness conclusion:
 
-- `iccad2026contest/checkpoints/dit_gnn_step_43299_epoch_11_end.pth` was not found.
-- `iccad2026contest/dit_gnn_step_43299_epoch_11_end.pth` was found, about 128 MB.
-- `iccad2026contest/checkpoints/dit_gnn_step_141000_loss_1.05.pth` was also found, about 128 MB.
-- `my_optimizer.py` loads from `Path(__file__).parent / "checkpoints"` unless `MY_OPTIMIZER_CHECKPOINT` is set, so the saved JSON does not prove which checkpoint produced it.
+- Basic correctness is stable enough for optimization diagnosis.
+- The current bottleneck is solution quality, not hard feasibility.
+- Any optimization attempt must preserve 100/100 feasibility.
+
+Checkpoint provenance caveat:
+
+- `iccad2026contest/checkpoints/dit_gnn_step_43299_epoch_11_end.pth` exists.
+- `iccad2026contest/checkpoints/dit_gnn_step_141000_loss_1.05.pth` also exists.
+- `my_optimizer.py` loads an explicit `MY_OPTIMIZER_CHECKPOINT` first, otherwise sorts `checkpoints/*.pth` by parsed step and therefore prefers `step_141000` over `step_43299`.
+- The saved JSON does not record which checkpoint was loaded. Future measurements intended to use `43299` should set `MY_OPTIMIZER_CHECKPOINT=/home/kuotzuwei15/pda/senpai/iccad2026contest/checkpoints/dit_gnn_step_43299_epoch_11_end.pth`.
 
 ## Current Performance Baseline
 
 | Metric | Value | Command | Verified? |
 |---|---:|---|---|
-| Score | 5.146680440 | Saved `iccad2026contest/eval_full_after_training.json`; compatible command is `python iccad2026_evaluate.py --evaluate my_optimizer.py --output eval_full_after_training.json` | Saved artifact parsed in this session; evaluator command not rerun |
-| Runtime | 7.6864 s average; 20.5084 s weighted average | Same saved artifact | Saved artifact parsed in this session; runtime is locally neutralized in score |
+| Score | 4.912480450 | Saved `iccad2026contest/eval_full_after_training.json`; compatible run command is `MY_OPTIMIZER_CHECKPOINT=/home/kuotzuwei15/pda/senpai/iccad2026contest/checkpoints/dit_gnn_step_43299_epoch_11_end.pth python iccad2026_evaluate.py --evaluate my_optimizer.py --output eval_full_after_training.json` | Saved artifact parsed and recomputed in this session; optimizer/evaluator command not rerun |
+| Runtime | 10.7188 s average in saved JSON; 31.6290 s weighted average | Same saved artifact | Parsed from saved artifact; local score neutralizes runtime |
 | Memory | Unknown | Not measured | Missing |
 
 Additional saved-artifact facts:
 
+- Timestamp: `2026-06-16T05:29:57.775120`.
 - Feasible cases: 100/100.
 - Capped feasible cases: 0/100.
-- Weighted `hpwl_gap`: `2.5651`.
-- Weighted `area_gap`: `2.5026`.
-- Weighted `violations_relative`: `0.1855`.
-- Weighted soft counts from read-only recomputation:
-  - boundary: `6.7767`
-  - grouping: `3.5418`
-  - MIB: `0.5367`
-  - total soft: `10.8552`
-  - max possible soft denominator: `58.9547`
+- Average cost: `4.494760179`.
+- Weighted `hpwl_gap`: `2.261854903`.
+- Weighted `area_gap`: `2.305821333`.
+- Weighted `violations_relative`: `0.202297801`.
+- Weighted soft counts from recomputation:
+  - boundary: `7.954748777`
+  - grouping: `3.325242990`
+  - MIB: `0.536719077`
+  - total soft: `11.816710844`
+  - max soft denominator: `58.954724081`
+- Weighted packing density of saved placements: `0.303169980`.
+- Weighted packing density of ground-truth baseline placements: `0.965993286`.
+- All 6,110 movable soft blocks in the saved solution are square.
+- About 93.31% of corresponding movable soft blocks are non-square in ground truth.
 
 ## Expected Performance Target
 
@@ -90,50 +102,57 @@ User target:
 
 - Converge to total score `<= 2.0`.
 
-Minimum constraints for any optimization attempt:
+Minimum constraints for optimization:
 
 - Preserve 100/100 local validation hard feasibility.
-- Measure before/after on the same evaluator command or comparable saved artifact.
-- Do not treat lower checkpoint loss as sufficient proof of score improvement.
-- Prioritize large cases because the 101-120 block bucket carries `81.13%` of the current weighted score.
+- Compare before/after on the same evaluator command or equivalent saved artifact.
+- Keep checkpoint provenance explicit.
+- Prioritize large cases because the 101-120 block bucket contributes `81.13%` of current weighted score.
 
 ## Gap Analysis
 
-Current total score is `5.1467`, so the gap to the requested target is about `3.1467` points.
+Current total score is `4.9125`, so the gap to target is about `2.9125` points.
 
-This is no longer a feasibility problem, and it is not mainly a boundary-only soft-violation problem. The bottleneck is the combined HPWL and bounding-box quality gap:
+This is not a feasibility problem:
 
-- If all soft violations were set to zero while HPWL and area stayed unchanged, estimated score would still be about `3.5339`.
-- If boundary violations alone were set to zero, estimated score would be about `4.0648`.
-- If grouping violations alone were set to zero, estimated score would be about `4.5549`.
-- If MIB violations alone were set to zero, estimated score would be about `5.0567`.
-- If HPWL gap alone were set to zero, estimated score would be about `3.2719`.
-- If area gap alone were set to zero, estimated score would be about `3.3304`.
-- If both HPWL and area gaps were set to zero while soft violations stayed unchanged, estimated score would be about `1.4556`.
+- Hard violations are zero.
+- There are no capped cases.
+
+This is also not only a soft-constraint problem:
+
+- If all soft violations were set to zero while HPWL and area stayed unchanged, estimated score would still be about `3.2838`.
+- If boundary violations alone were set to zero, estimated score would be about `3.7629`.
+- If grouping violations alone were set to zero, estimated score would be about `4.3787`.
+- If MIB violations alone were set to zero, estimated score would be about `4.8258`.
+
+The dominant bottleneck is joint HPWL and bounding-box quality:
+
+- If HPWL gap alone were set to zero, estimated score would be about `3.2273`.
+- If area gap alone were set to zero, estimated score would be about `3.1970`.
+- If both HPWL and area gaps were set to zero while soft violations stayed unchanged, estimated score would be about `1.5118`.
 
 Uniform reduction estimates:
 
-- With current soft violations, HPWL and area gaps must both shrink to about `14.75%` of their current values to reach `<= 2.0`.
-- If soft violations are cut in half, HPWL and area gaps still must both shrink to about `26.02%` of current values.
-- If soft violations are eliminated entirely, HPWL and area gaps still need to shrink to about `39%` of current values to be comfortably below `2.0`.
+- With current soft violations, HPWL and area gaps must both shrink to about `14.36%` of current values to reach `<= 2.0`.
+- If soft violations are cut in half, HPWL and area gaps still must both shrink to about `27.79%` of current values.
+- If soft violations are eliminated, HPWL and area gaps still must both shrink to about `43.79%` of current values.
 
-Top weighted contributors are large cases:
+Top weighted contributors:
 
 | Test ID | Blocks | Cost | Weight Share | HPWL Gap | Area Gap | V_rel |
 |---:|---:|---:|---:|---:|---:|---:|
-| 99 | 120 | 5.2716 | 0.0800 | 2.413 | 3.179 | 0.164 |
-| 98 | 119 | 5.0467 | 0.0736 | 2.163 | 2.199 | 0.231 |
-| 95 | 116 | 5.9394 | 0.0573 | 3.492 | 2.766 | 0.182 |
-| 97 | 118 | 4.6236 | 0.0677 | 2.144 | 1.852 | 0.217 |
-| 92 | 113 | 6.4332 | 0.0446 | 3.649 | 3.353 | 0.179 |
+| 99 | 120 | 5.2716 | 0.0800 | 2.4130 | 3.1792 | 0.1642 |
+| 98 | 119 | 5.0467 | 0.0736 | 2.1632 | 2.1988 | 0.2308 |
+| 95 | 116 | 5.9394 | 0.0573 | 3.4919 | 2.7657 | 0.1818 |
+| 97 | 118 | 4.6236 | 0.0677 | 2.1438 | 1.8515 | 0.2167 |
+| 94 | 115 | 5.4420 | 0.0527 | 3.6158 | 2.6355 | 0.1385 |
 
-The 101-120 bucket has:
+Large-case buckets:
 
-- Weighted score: `5.0993`.
-- Weighted HPWL gap: `2.5246`.
-- Weighted area gap: `2.5478`.
-- Weighted `violations_relative`: `0.1811`.
-- Weighted runtime: `22.8550 s`.
+| Bucket | Weight Share | Score | HPWL Gap | Area Gap | V_rel | Weighted Runtime |
+|---|---:|---:|---:|---:|---:|---:|
+| 101-120 | 0.8113 | 4.9223 | 2.2568 | 2.3455 | 0.2002 | 35.7785 s |
+| 116-120 | 0.3408 | 4.9513 | 2.3689 | 2.5424 | 0.1788 | 54.8936 s |
 
 ## Benchmark or Evaluator Details
 
@@ -143,7 +162,9 @@ The local evaluator computes feasible cost as:
 Cost = (1 + 0.5 * (max(0, HPWL_gap) + max(0, Area_gap))) * exp(2 * V_rel) * RuntimeAdjustment
 ```
 
-Local full evaluation then neutralizes runtime with `RuntimeFactor = 1.0` before recomputing final costs, so runtime is recorded but is not the direct reason the saved score is `5.1467`.
+Hard infeasibility costs exactly `10.0`, while feasible costs are capped below `10.0`.
+
+The local full evaluation neutralizes runtime when recomputing final costs with `RuntimeFactor = 1.0`, so runtime is recorded but does not explain the saved local score.
 
 The total score is an exponentially weighted average:
 
@@ -157,68 +178,71 @@ Soft violations are:
 V_rel = (boundary + grouping + MIB) / N_soft
 ```
 
-Hard infeasibility would cost exactly `10.0`, but the current artifact is hard-feasible.
+The saved artifact has `positions` for all cases, enabling read-only component recomputation without rerunning the optimizer.
 
 ## Observed Bottlenecks
 
-- The boundary-frame attempt worked, but it did not get close to the target: score improved to about `5.15`, boundary violations dropped, and capped cases disappeared, yet weighted HPWL and area gaps remain about `2.5`.
-- `ConstructiveCandidateLegalizer._score_unit_origin(...)` still sets `connection_cost = 0.0`, so origin selection does not use block-to-block or pin-to-block connectivity while placing units.
-- The final `CandidateSelector` scores full candidates by HPWL, bbox area, and soft violations, but it can only choose among candidates already generated. It cannot fix connectivity-blind choices inside a candidate.
-- `HardConstraintNormalizer._soft_dimensions(...)` still uses square dimensions for all non-fixed soft blocks. This leaves no aspect-ratio search to reduce bbox area or improve wirelength.
-- The current `my_optimizer.py` has one structured boundary-frame candidate. The read-only `noML_optimizer.py` reference contains additional unported mechanisms: connected bottom-left placement, multiple skyline width hints, local swap/relocation/shelf-width trials, aspect trials, MIB sync, frame compaction, and rip-up/repack for large cases.
-- Checkpoint provenance is ambiguous because the requested `43299` checkpoint is not in the default loader directory and the saved JSON does not record `MY_OPTIMIZER_CHECKPOINT`.
+- The connection-aware origin scoring attempt improved score from about `5.1467` to `4.9125`, but HPWL and area gaps remain above `2.2` on a weighted basis.
+- Packing density is extremely low: weighted saved-placement density is about `0.30`, while the baseline density is about `0.97`.
+- The simple boundary-frame candidate in `my_optimizer.py` packs interior units with a shelf strategy and fixed central-width heuristic. It does not run a bounded frame compaction pass.
+- The 101-120 bucket contributes `81.13%` of the weighted score and still scores about `4.9223`.
+- The current connection-aware origin scoring now considers B2B/P2B distances during constructive placement, so the previous most obvious HPWL-blind construction bottleneck is no longer the first target.
+- `HardConstraintNormalizer._soft_dimensions(...)` still uses square dimensions for all non-fixed soft blocks, which leaves no aspect-ratio search.
+- The training proxy explicitly omits several final-evaluation constraints and cannot directly optimize the legalizer's final sparse packing behavior.
 
 ## Likely Causes
 
-### Cause 1: Connectivity-blind construction inside candidate generation
-
-- Type: Heuristic mismatch / algorithmic limitation.
-- Evidence: Weighted `hpwl_gap` is `2.5651`. In `my_optimizer.py`, `_score_unit_origin(...)` sets `connection_cost = 0.0`, so candidate construction does not account for already placed connected blocks or pins. `noML_optimizer.py` has a reference `_unit_site_connection_cost_indexed(...)` that scores both B2B and P2B distances during placement.
-- Affected modules: `ConstructiveCandidateLegalizer._score_unit_origin`, `ConstructiveCandidateLegalizer._choose_unit_origin`, `ConstructiveCandidateLegalizer._generate_unit_origins`.
-- Risk: Medium. Adding connection scoring can trade HPWL against area/boundary quality and may slow large cases if implemented naively.
-- Confidence: High.
-
-### Cause 2: Shape search is too narrow for the area target
-
-- Type: Algorithmic limitation / parameterization issue.
-- Evidence: Weighted `area_gap` is `2.5026`, similar in magnitude to weighted HPWL gap. The current normalizer uses square soft-block dimensions only. The contest allows arbitrary aspect ratios for soft blocks, and `noML_optimizer.py` contains bounded aspect and MIB-sync trial machinery that is not present in `my_optimizer.py`.
-- Affected modules: `HardConstraintNormalizer._soft_dimensions`, `ConstructiveCandidateLegalizer._build_units`, candidate generation, candidate selection.
-- Risk: Medium. Any dimension trial must preserve soft-block area within 1%, fixed-shape dimensions, preplaced dimensions/positions, and non-overlap.
-- Confidence: High.
-
-### Cause 3: Large-case candidate-set ceiling after boundary-frame improvement
+### Cause 1: Sparse boundary-frame and shelf packing on large cases
 
 - Type: Algorithmic limitation / search-control limitation.
-- Evidence: The 101-120 bucket contributes `81.13%` of score and still has score `5.0993`. Current `my_optimizer.py` has three order variants plus one boundary-frame candidate family, while the reference noML path has connected skyline placement, frame compaction, bounded local search, and rip-up/repack especially for larger cases. The current artifact has no capped cases, so the next gap is quality of the feasible candidate set rather than feasibility repair.
-- Affected modules: `ConstructiveCandidateLegalizer`, `SoftConstraintImprover`, `CandidateSelector`, `MyOptimizer.solve`.
-- Risk: Medium to high. Candidate expansion can raise runtime, and official hidden-test runtime normalization may penalize slow large-case search.
+- Evidence: Weighted packing density is `0.3032` versus ground-truth baseline density `0.9660`; weighted area gap is `2.3058`. The current `ConstructiveCandidateLegalizer._boundary_frame_candidate(...)` computes a single frame and places interior units through `_pack_shelf_unit_origins(...)`; no large-case frame compaction is present. The 101-120 bucket accounts for `81.13%` of score and still scores `4.9223`.
+- Affected modules: `ConstructiveCandidateLegalizer._boundary_frame_candidate`, `ConstructiveCandidateLegalizer._pack_shelf_unit_origins`, `CandidateSelector.best_feasible`, `MyOptimizer.solve`.
+- Risk: Medium. More candidate generation can improve density but may increase runtime and can regress soft-boundary satisfaction if not checker/selector guarded.
 - Confidence: High.
+
+### Cause 2: Soft-block shape search is still too narrow
+
+- Type: Algorithmic limitation / parameterization issue.
+- Evidence: `HardConstraintNormalizer._soft_dimensions(...)` returns square dimensions for every soft movable block. In the saved solution, all 6,110 movable soft blocks are square, while about 93.31% of corresponding ground-truth movable soft blocks are non-square. The contest permits arbitrary soft-block aspect ratios as long as area tolerance is preserved.
+- Affected modules: `HardConstraintNormalizer._soft_dimensions`, `ConstructiveCandidateLegalizer._build_units`, candidate generation, candidate selection, feasibility checking.
+- Risk: Medium to high. Shape changes must preserve area, fixed/preplaced immutability, non-overlap, and MIB behavior; a shape search can easily trade one quality term against another.
+- Confidence: High.
+
+### Cause 3: Checkpoint loss is optimizing a proxy, not final post-legalization score
+
+- Type: Benchmark/evaluator mismatch / model-guidance limitation.
+- Evidence: README and `compute_training_loss(...)` document that training loss is a proxy and does not check all placement constraints, including fixed, MIB, cluster, and boundary. In `my_optimizer.py`, model output is advisory; final coordinates are produced by deterministic legalizers and candidate selection. The lower-loss `43299` checkpoint can improve guidance, but it cannot by itself fix sparse frame/shelf packing or missing shape/aspect search.
+- Affected modules: `training_example.py`, `DiffusionGuidanceAdapter`, `ConstructiveCandidateLegalizer`, checkpoint-loading path in `MyOptimizer.__init__`.
+- Risk: Low for diagnosis, medium for future training changes. Further training may produce diminishing returns unless the legalizer/search target is improved.
+- Confidence: Medium.
 
 ## Optimization Hypotheses
 
 | Priority | Hypothesis | Expected Impact | Risk | Affected Files | Verification |
 |---:|---|---|---|---|---|
-| 1 | Add bounded incremental B2B/P2B connection cost to constructive unit-origin scoring so placement sites are chosen with HPWL awareness before full candidates are finalized. | High. Directly targets weighted `hpwl_gap` `2.5651` and should help large cases where connected blocks are currently spread by area/boundary heuristics. | Medium. Must cache adjacency/pin indexes and keep runtime bounded; may worsen bbox if weighting is too strong. | `iccad2026contest/my_optimizer.py` | Validate, single-case eval, full eval, compare score, weighted HPWL, area gap, V_rel, runtime. |
-| 2 | Add one bounded aspect-ratio candidate family for ordinary soft blocks and keep only selector-approved feasible candidates. | High. Directly targets weighted `area_gap` `2.5026` and can also reduce HPWL by making boundary/interior packing more compact. | Medium. Dimension changes must preserve area tolerance and cannot touch fixed/preplaced blocks; may interact with grouping/MIB macros. | `iccad2026contest/my_optimizer.py` | Validate hard feasibility; compare area gap, HPWL, MIB, total score, and runtime. |
-| 3 | Port a small subset of noML-style large-case local search, starting with connected skyline or limited rip-up/repack for the 101-120 bucket only. | High but less isolated. Targets the dominant weighted bucket and can jointly improve HPWL/area/grouping after initial construction. | High. More code and runtime risk; needs strict trial budgets and rollback on full-eval slowdown or score regression. | `iccad2026contest/my_optimizer.py` | Full eval with bucket analysis; keep only if 101-120 weighted score improves and runtime remains practical. |
+| 1 | Add one bounded large-case frame-compaction candidate family that reuses the current boundary-frame grouping, tries 2-4 central-width hints for `n >= 100`, repacks interior units with connection-aware bottom-left or shelf placement, and lets the existing checker/selector accept only feasible improvements. | High. Directly targets weighted area gap `2.3058`, low density `0.3032`, and the 101-120 bucket that contributes `81.13%` of score; can also reduce HPWL by compacting connected interiors. | Medium. Candidate generation can raise runtime; boundary/grouping soft counts may regress if the candidate selector proxy is weak. | `iccad2026contest/my_optimizer.py` | `python -B -m py_compile iccad2026contest/my_optimizer.py`; validate; single-case eval; full eval; compare total score, weighted area gap, HPWL, V_rel, density, and runtime. |
+| 2 | Add bounded soft-block aspect-ratio trials for ordinary non-fixed, non-preplaced, non-MIB single-block units, preserving exact area and relying on full feasibility checks before selection. | Medium to high. Targets the all-square shape limitation and may improve both area and HPWL after compaction exists. | Medium to high. Shape changes interact with packing, MIB, grouping, and hard area tolerance. | `iccad2026contest/my_optimizer.py` | Validate hard feasibility; compare area gap, HPWL, MIB violations, total score, and runtime. |
+| 3 | Add a normalized selector proxy that better balances HPWL, bbox area, and soft violations across candidate families, using problem-local scale estimates instead of raw `hpwl + 0.01 * bbox_area + 1000 * soft_relative`. | Medium. May let already generated candidates win when they improve the true score proxy. | Medium. Without official baselines inside `solve()`, normalization must be approximate; bad weights can regress score. | `iccad2026contest/my_optimizer.py` | Run full eval and compare candidate-family behavior through score components. |
 
 ## Recommended First Optimization
 
-Implement Hypothesis 1 first: add bounded incremental connection-aware unit-origin scoring.
+Implement Hypothesis 1 first: add one bounded large-case frame-compaction candidate family.
 
 Concrete scope:
 
-- Keep the existing candidate families, boundary-frame candidate, checker, and selector.
-- Add helper logic inside `ConstructiveCandidateLegalizer` to index B2B neighbors and P2B edges once per solve or candidate construction.
-- When scoring a unit origin, compute incremental Manhattan distance from that unit's block centers to already placed connected block centers and to fixed pins.
-- Use the connection cost as a bounded term in `_score_unit_origin(...)`, preferably after hard boundary feasibility preference but before weak tie-breakers such as predicted distance and coordinate bias.
-- Do not add broad local search, aspect trials, MIB sync, or training changes in this first attempt.
+- Keep current dimensions, checkpoint handling, hard checker, fallback, connection-aware origin scoring, and candidate selector.
+- Add a small candidate family inside `ConstructiveCandidateLegalizer` for `problem.block_count >= 100` and cases with boundary-constrained units.
+- Start from the current boundary-frame grouping, then try a few central-width hints, such as scaled current width and aspect-derived widths.
+- Repack interior units more compactly within the central area, preferably using the existing connection index when choosing origins.
+- Place boundary rail/corner units on the frame edges without overlap.
+- Generate only a small number of candidates, dedupe by position signature, and pass them through existing `FeasibilityChecker` and `CandidateSelector`.
+- Do not add aspect-ratio changes, MIB sync, broad local search, rip-up/repack, training changes, or checkpoint changes in this first attempt.
 
 Rollback condition:
 
-- Revert if 100/100 feasibility is lost, total score does not improve over `5.146680440`, weighted HPWL does not improve, or average/large-case runtime grows substantially without score improvement.
+- Revert if 100/100 feasibility is lost, total score does not improve over `4.912480450`, weighted area gap does not improve, or average/large-case runtime grows substantially without score improvement.
 
-This is the smallest next step that directly attacks the dominant quality bottleneck while preserving the existing legalizer and selector safety net.
+This is the smallest next step that targets the strongest measured bottleneck while avoiding the higher hard-constraint risk of changing block dimensions.
 
 ## Exact Prompt for Implementation Loop
 
@@ -250,22 +274,22 @@ Rules:
 ## Stop Conditions
 
 - Stop if any change causes hard infeasibility.
-- Stop if connection-aware scoring increases total score or weighted HPWL after full evaluation.
-- Stop if runtime grows substantially on large cases without a score improvement.
+- Stop if frame-compaction candidates increase total score or weighted area gap after full evaluation.
+- Stop if runtime grows substantially on 101-120 block cases without score improvement.
 - Stop before running training, installing dependencies, downloading data, or deleting/moving checkpoints without approval.
-- Stop if the run intended to use `dit_gnn_step_43299_epoch_11_end.pth` cannot prove it actually loaded that checkpoint.
+- Stop if a run intended to use `dit_gnn_step_43299_epoch_11_end.pth` cannot prove it loaded that checkpoint.
 
 ## Risks and Warnings
 
-- The current baseline is a saved artifact, not an evaluator rerun from this diagnosis.
-- Runtime is neutralized locally but may matter on the official leaderboard.
-- The requested checkpoint path is inconsistent with the local loader directory. To avoid relative-path ambiguity, a future evaluator run that intends to use the `43299` checkpoint should set `MY_OPTIMIZER_CHECKPOINT=/home/kuotzuwei15/pda/senpai/iccad2026contest/dit_gnn_step_43299_epoch_11_end.pth`, or the file should be placed under `iccad2026contest/checkpoints/` with approval.
-- Training loss omits boundary, grouping, and MIB constraints, and lower checkpoint loss alone will not solve the current HPWL/bbox candidate-quality bottleneck.
-- The target `<= 2.0` likely needs multiple optimization loops: connection-aware placement plus shape/aspect or local-search improvements.
+- The current baseline is a saved artifact plus read-only recomputation, not an optimizer rerun during this diagnosis.
+- Runtime is neutralized locally but may matter on the official leaderboard; current saved JSON reports `10.7188 s` average and `31.6290 s` weighted runtime.
+- The default checkpoint loader will prefer `dit_gnn_step_141000_loss_1.05.pth` unless `MY_OPTIMIZER_CHECKPOINT` is set to the `43299` path.
+- The score target `<= 2.0` is unlikely to be reached by soft-constraint cleanup alone. It requires large reductions in both HPWL and area gaps.
+- Changing soft-block aspect ratios is promising, but it should follow a packing-density improvement because sparse layouts can dominate area gap even with better shapes.
 
 ## Open Questions
 
 - Was `MY_OPTIMIZER_CHECKPOINT` set when `iccad2026contest/eval_full_after_training.json` was generated?
-- Should the `43299` checkpoint be copied or moved into `iccad2026contest/checkpoints/`, or should future runs use the environment variable explicitly?
-- What score does `noML_optimizer.py` achieve under the current evaluator and checkpoint-free conditions?
-- Should future training include differentiable proxies for boundary, grouping, MIB, and legalizer-aware HPWL after construction-time scoring is improved?
+- Should future full runs always write the checkpoint path into a sidecar note or result filename to avoid provenance ambiguity?
+- What score does `noML_optimizer.py` achieve under the same validation command and checkpoint-free conditions?
+- Should future training include legalizer-aware or post-legalization losses after the constructive candidate set is less sparse?

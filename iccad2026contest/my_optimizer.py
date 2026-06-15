@@ -1583,6 +1583,8 @@ class ConstructiveConnectionIndex:
 class ConstructiveCandidateLegalizer:
     ROUND_DIGITS = 9
     MAX_CANDIDATES_PER_UNIT = 96
+    FRAME_COMPACTION_MIN_BLOCKS = 100
+    FRAME_COMPACTION_MAX_CANDIDATES = 4
     PROXY_SOFT_WEIGHT = 1000.0
     PROXY_BBOX_WEIGHT = 0.01
     BOUNDARY_FRAME_GAP = 1.0
@@ -1614,7 +1616,11 @@ class ConstructiveCandidateLegalizer:
             seen.add(signature)
             candidates.append((source, positions))
 
-        for source, positions in cls._boundary_frame_candidates(problem, units):
+        for source, positions in cls._boundary_frame_candidates(
+            problem,
+            units,
+            connection_index,
+        ):
             signature = cls._positions_signature(positions)
             if signature in seen:
                 continue
@@ -1786,6 +1792,7 @@ class ConstructiveCandidateLegalizer:
         cls,
         problem: NormalizedProblem,
         units: List[ConstructiveUnit],
+        connection_index: ConstructiveConnectionIndex,
     ) -> List[Tuple[str, List[Tuple[float, float, float, float]]]]:
         if not any(unit.boundary_mask for unit in units):
             return []
@@ -1797,10 +1804,18 @@ class ConstructiveCandidateLegalizer:
             unit.min_block_id,
             unit.unit_id,
         ))
+        candidates: List[Tuple[str, List[Tuple[float, float, float, float]]]] = []
         positions = cls._boundary_frame_candidate(problem, ordered_units)
-        if positions is None:
-            return []
-        return [("constructive:boundary_frame_structured", positions)]
+        if positions is not None:
+            candidates.append(("constructive:boundary_frame_structured", positions))
+
+        candidates.extend(cls._boundary_frame_compaction_candidates(
+            problem,
+            ordered_units,
+            positions,
+            connection_index,
+        ))
+        return candidates
 
     @classmethod
     def _boundary_frame_candidate(
@@ -2033,6 +2048,725 @@ class ConstructiveCandidateLegalizer:
             max_y = max(max_y, y_cursor + height)
 
         return origins, max_x - x_origin, max_y - y_origin
+
+    @classmethod
+    def _boundary_frame_compaction_candidates(
+        cls,
+        problem: NormalizedProblem,
+        ordered_units: List[ConstructiveUnit],
+        start_positions: Optional[List[Tuple[float, float, float, float]]],
+        connection_index: ConstructiveConnectionIndex,
+    ) -> List[Tuple[str, List[Tuple[float, float, float, float]]]]:
+        if problem.block_count < cls.FRAME_COMPACTION_MIN_BLOCKS:
+            return []
+        if not any(unit.boundary_mask for unit in ordered_units):
+            return []
+
+        groups = cls._boundary_frame_groups(ordered_units)
+        corners = cls._boundary_frame_corners(groups)
+        left_width = max(
+            cls._max_unit_width(groups["left"]),
+            cls._valid_unit_width(corners["top_left"]) if corners["top_left"] else 0.0,
+            cls._valid_unit_width(corners["bottom_left"]) if corners["bottom_left"] else 0.0,
+        )
+        right_width = max(
+            cls._max_unit_width(groups["right"]),
+            cls._valid_unit_width(corners["top_right"]) if corners["top_right"] else 0.0,
+            cls._valid_unit_width(corners["bottom_right"]) if corners["bottom_right"] else 0.0,
+        )
+        rail_central_width = max(
+            cls._sum_unit_widths(groups["top"]),
+            cls._sum_unit_widths(groups["bottom"]),
+        )
+        current_width = cls._positions_width(start_positions)
+        candidates: List[Tuple[str, List[Tuple[float, float, float, float]]]] = []
+        seen_widths = set()
+
+        for central_width in cls._frame_compaction_central_width_hints(
+            groups["interior"],
+            rail_central_width,
+            current_width,
+            left_width,
+            right_width,
+        ):
+            width_key = round(central_width, 6)
+            if width_key in seen_widths:
+                continue
+            seen_widths.add(width_key)
+
+            positions = cls._boundary_frame_compaction_candidate(
+                problem,
+                ordered_units,
+                central_width,
+                start_positions,
+                connection_index,
+            )
+            if positions is None:
+                continue
+            candidates.append((
+                f"constructive:frame_compact:{len(candidates)}",
+                positions,
+            ))
+            if len(candidates) >= cls.FRAME_COMPACTION_MAX_CANDIDATES:
+                break
+
+        return candidates
+
+    @classmethod
+    def _boundary_frame_compaction_candidate(
+        cls,
+        problem: NormalizedProblem,
+        ordered_units: List[ConstructiveUnit],
+        central_width_hint: float,
+        start_positions: Optional[List[Tuple[float, float, float, float]]],
+        connection_index: ConstructiveConnectionIndex,
+    ) -> Optional[List[Tuple[float, float, float, float]]]:
+        state = cls._initial_state_with_anchors(problem)
+        if state.failed:
+            return None
+
+        groups = cls._boundary_frame_groups(ordered_units)
+        corners = cls._boundary_frame_corners(groups)
+        left_units = groups["left"]
+        right_units = groups["right"]
+        top_units = groups["top"]
+        bottom_units = groups["bottom"]
+        interior_units = groups["interior"]
+
+        left_width = max(
+            cls._max_unit_width(left_units),
+            cls._valid_unit_width(corners["top_left"]) if corners["top_left"] else 0.0,
+            cls._valid_unit_width(corners["bottom_left"]) if corners["bottom_left"] else 0.0,
+        )
+        right_width = max(
+            cls._max_unit_width(right_units),
+            cls._valid_unit_width(corners["top_right"]) if corners["top_right"] else 0.0,
+            cls._valid_unit_width(corners["bottom_right"]) if corners["bottom_right"] else 0.0,
+        )
+        top_height = cls._max_unit_height(top_units)
+        bottom_height = cls._max_unit_height(bottom_units)
+        rail_central_width = max(
+            cls._sum_unit_widths(top_units),
+            cls._sum_unit_widths(bottom_units),
+        )
+        central_width_hint = max(
+            float(central_width_hint),
+            rail_central_width,
+            cls._max_unit_width(interior_units),
+            1.0,
+        )
+
+        relative_interior_origins, interior_width, interior_height = (
+            cls._pack_connected_bottom_left_unit_origins(
+                problem,
+                interior_units,
+                central_width_hint,
+                (0.0, 0.0),
+                {},
+                connection_index,
+            )
+        )
+        central_width = max(central_width_hint, interior_width, rail_central_width)
+
+        central_column_height = bottom_height + interior_height + top_height
+        left_column_height = (
+            (cls._valid_unit_height(corners["bottom_left"]) if corners["bottom_left"] else 0.0)
+            + cls._sum_unit_heights(left_units)
+            + (cls._valid_unit_height(corners["top_left"]) if corners["top_left"] else 0.0)
+        )
+        right_column_height = (
+            (cls._valid_unit_height(corners["bottom_right"]) if corners["bottom_right"] else 0.0)
+            + cls._sum_unit_heights(right_units)
+            + (cls._valid_unit_height(corners["top_right"]) if corners["top_right"] else 0.0)
+        )
+
+        frame_width = max(left_width + central_width + right_width, 1.0)
+        frame_height = max(central_column_height, left_column_height, right_column_height, 1.0)
+        anchor_bbox = AnchorAwareLegalizer._bbox(state.occupied)
+        frame_x = cls._boundary_frame_x_origin(anchor_bbox, frame_width, ordered_units)
+        frame_y, frame_height = cls._boundary_frame_y_origin_and_height(anchor_bbox, frame_height)
+        central_x = frame_x + left_width
+        interior_y = frame_y + bottom_height
+
+        origins: Dict[str, Tuple[float, float]] = {}
+        placed_centers: Dict[int, Tuple[float, float]] = {}
+
+        for unit_id, (local_x, local_y) in relative_interior_origins.items():
+            origin = (central_x + local_x, interior_y + local_y)
+            origins[unit_id] = origin
+
+        interior_by_id = {unit.unit_id: unit for unit in interior_units}
+        for unit_id, origin in list(origins.items()):
+            unit = interior_by_id.get(unit_id)
+            if unit is not None:
+                placed_centers.update(cls._unit_block_centers_at_origin(unit, origin))
+
+        corner_origins = {
+            "bottom_left": (frame_x, frame_y),
+            "bottom_right": (
+                frame_x + frame_width - (
+                    cls._valid_unit_width(corners["bottom_right"])
+                    if corners["bottom_right"] else 0.0
+                ),
+                frame_y,
+            ),
+            "top_left": (
+                frame_x,
+                frame_y + frame_height - (
+                    cls._valid_unit_height(corners["top_left"])
+                    if corners["top_left"] else 0.0
+                ),
+            ),
+            "top_right": (
+                frame_x + frame_width - (
+                    cls._valid_unit_width(corners["top_right"])
+                    if corners["top_right"] else 0.0
+                ),
+                frame_y + frame_height - (
+                    cls._valid_unit_height(corners["top_right"])
+                    if corners["top_right"] else 0.0
+                ),
+            ),
+        }
+        for corner_name, unit in corners.items():
+            if unit is None:
+                continue
+            origin = corner_origins[corner_name]
+            origins[unit.unit_id] = origin
+            placed_centers.update(cls._unit_block_centers_at_origin(unit, origin))
+
+        current_origins = cls._unit_origin_map_from_positions(ordered_units, start_positions)
+        if not cls._place_boundary_rail_units(
+            bottom_units,
+            "bottom",
+            central_x,
+            central_x + central_width,
+            frame_x,
+            frame_y,
+            frame_width,
+            frame_height,
+            current_origins,
+            origins,
+            placed_centers,
+            connection_index,
+        ):
+            return None
+        if not cls._place_boundary_rail_units(
+            top_units,
+            "top",
+            central_x,
+            central_x + central_width,
+            frame_x,
+            frame_y,
+            frame_width,
+            frame_height,
+            current_origins,
+            origins,
+            placed_centers,
+            connection_index,
+        ):
+            return None
+
+        left_lower = frame_y + (
+            cls._valid_unit_height(corners["bottom_left"])
+            if corners["bottom_left"] else 0.0
+        )
+        left_upper = frame_y + frame_height - (
+            cls._valid_unit_height(corners["top_left"])
+            if corners["top_left"] else 0.0
+        )
+        right_lower = frame_y + (
+            cls._valid_unit_height(corners["bottom_right"])
+            if corners["bottom_right"] else 0.0
+        )
+        right_upper = frame_y + frame_height - (
+            cls._valid_unit_height(corners["top_right"])
+            if corners["top_right"] else 0.0
+        )
+        if not cls._place_boundary_rail_units(
+            left_units,
+            "left",
+            left_lower,
+            left_upper,
+            frame_x,
+            frame_y,
+            frame_width,
+            frame_height,
+            current_origins,
+            origins,
+            placed_centers,
+            connection_index,
+        ):
+            return None
+        if not cls._place_boundary_rail_units(
+            right_units,
+            "right",
+            right_lower,
+            right_upper,
+            frame_x,
+            frame_y,
+            frame_width,
+            frame_height,
+            current_origins,
+            origins,
+            placed_centers,
+            connection_index,
+        ):
+            return None
+
+        if not cls._apply_unit_origins(state, ordered_units, origins):
+            return None
+        if state.failed or not state.is_complete:
+            return None
+        return state.as_positions(problem)
+
+    @classmethod
+    def _boundary_frame_corners(
+        cls,
+        groups: Dict[str, List[ConstructiveUnit]],
+    ) -> Dict[str, Optional[ConstructiveUnit]]:
+        return {
+            name: values[0] if values else None
+            for name, values in (
+                ("top_left", groups["top_left"]),
+                ("top_right", groups["top_right"]),
+                ("bottom_left", groups["bottom_left"]),
+                ("bottom_right", groups["bottom_right"]),
+            )
+        }
+
+    @classmethod
+    def _frame_compaction_central_width_hints(
+        cls,
+        interior_units: List[ConstructiveUnit],
+        rail_central_width: float,
+        current_width: Optional[float],
+        left_width: float,
+        right_width: float,
+    ) -> List[float]:
+        minimum = max(rail_central_width, cls._max_unit_width(interior_units), 1.0)
+        hints = {minimum}
+
+        if current_width is not None and math.isfinite(current_width) and current_width > 0.0:
+            for scale in (0.55, 0.68, 0.82, 0.95):
+                compact_width = current_width * scale - left_width - right_width
+                if compact_width >= minimum - FeasibilityChecker.OVERLAP_EPS:
+                    hints.add(max(minimum, compact_width))
+
+        for aspect in (0.8, 1.0, 1.25, 1.5):
+            width = cls._shelf_width_for_units(interior_units, aspect)
+            if math.isfinite(width) and width > 0.0:
+                hints.add(max(minimum, width))
+
+        return sorted(hints)
+
+    @classmethod
+    def _pack_connected_bottom_left_unit_origins(
+        cls,
+        problem: NormalizedProblem,
+        units: List[ConstructiveUnit],
+        target_width: float,
+        global_offset: Tuple[float, float],
+        fixed_block_centers: Dict[int, Tuple[float, float]],
+        connection_index: ConstructiveConnectionIndex,
+    ) -> Tuple[Dict[str, Tuple[float, float]], float, float]:
+        origins: Dict[str, Tuple[float, float]] = {}
+        if not units:
+            return origins, 0.0, 0.0
+
+        target_width = max(target_width, cls._max_unit_width(units), 1.0)
+        total_area = max(sum(unit.area for unit in units), 1.0)
+        placed_rects: List[Tuple[float, float, float, float]] = []
+        placed_bbox: Optional[Tuple[float, float, float, float]] = None
+        placed_centers = dict(fixed_block_centers)
+        remaining = sorted(
+            units,
+            key=lambda unit: (
+                unit.guidance_rank,
+                -unit.area,
+                unit.min_block_id,
+                unit.unit_id,
+            ),
+        )
+        max_x = 0.0
+        max_y = 0.0
+        global_x, global_y = global_offset
+
+        while remaining:
+            unit = min(
+                remaining,
+                key=lambda candidate: (
+                    -cls._unit_frontier_weight(candidate, placed_centers, connection_index),
+                    -cls._unit_pin_weight(candidate, connection_index),
+                    -cls._unit_connectivity_weight(candidate, connection_index),
+                    -candidate.area,
+                    candidate.guidance_rank,
+                    candidate.min_block_id,
+                    candidate.unit_id,
+                ),
+            )
+            remaining.remove(unit)
+
+            width = cls._valid_unit_width(unit)
+            height = cls._valid_unit_height(unit)
+            best_origin: Optional[Tuple[float, float]] = None
+            best_key: Optional[Tuple[float, float, float, float, float, int, str]] = None
+
+            for x in cls._bottom_left_x_positions(placed_rects, target_width, width):
+                y = cls._bottom_left_y_at_x(x, width, height, placed_rects)
+                local_rect = (x, y, width, height)
+                candidate_bbox = AnchorAwareLegalizer._expanded_bbox(placed_bbox, local_rect)
+                bbox_area = AnchorAwareLegalizer._bbox_area(candidate_bbox) / total_area
+                global_origin = (global_x + x, global_y + y)
+                connection_cost = cls._site_connection_cost(
+                    unit,
+                    global_origin,
+                    candidate_bbox,
+                    global_offset,
+                    connection_index,
+                    placed_centers,
+                )
+                key = (
+                    bbox_area + cls.CONNECTION_SCORE_WEIGHT * connection_cost,
+                    bbox_area,
+                    connection_cost,
+                    y + height,
+                    x,
+                    unit.min_block_id,
+                    unit.unit_id,
+                )
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_origin = (x, y)
+
+            if best_origin is None:
+                best_origin = (0.0, max_y)
+
+            x, y = best_origin
+            origins[unit.unit_id] = best_origin
+            placed_rect = (x, y, width, height)
+            placed_rects.append(placed_rect)
+            placed_bbox = AnchorAwareLegalizer._expanded_bbox(placed_bbox, placed_rect)
+            placed_centers.update(cls._unit_block_centers_at_origin(
+                unit,
+                (global_x + x, global_y + y),
+            ))
+            max_x = max(max_x, x + width)
+            max_y = max(max_y, y + height)
+
+        return origins, max_x, max_y
+
+    @staticmethod
+    def _bottom_left_x_positions(
+        placed: List[Tuple[float, float, float, float]],
+        target_width: float,
+        width: float,
+    ) -> List[float]:
+        x_limit = max(0.0, target_width - width)
+        candidates = {0.0, x_limit}
+        for x, _, placed_width, _ in placed:
+            candidates.add(x)
+            candidates.add(x + placed_width)
+        return sorted(
+            x
+            for x in candidates
+            if -FeasibilityChecker.OVERLAP_EPS <= x <= x_limit + FeasibilityChecker.OVERLAP_EPS
+        )
+
+    @staticmethod
+    def _bottom_left_y_at_x(
+        x: float,
+        width: float,
+        height: float,
+        placed: List[Tuple[float, float, float, float]],
+    ) -> float:
+        y = 0.0
+        while True:
+            next_y = y
+            for placed_x, placed_y, placed_width, placed_height in placed:
+                horizontally_overlaps = (
+                    x < placed_x + placed_width - FeasibilityChecker.OVERLAP_EPS
+                    and x + width > placed_x + FeasibilityChecker.OVERLAP_EPS
+                )
+                vertically_overlaps = (
+                    y < placed_y + placed_height - FeasibilityChecker.OVERLAP_EPS
+                    and y + height > placed_y + FeasibilityChecker.OVERLAP_EPS
+                )
+                if horizontally_overlaps and vertically_overlaps:
+                    next_y = max(next_y, placed_y + placed_height)
+            if next_y <= y + FeasibilityChecker.OVERLAP_EPS:
+                return y
+            y = next_y
+
+    @classmethod
+    def _rail_axis_positions(
+        cls,
+        lower: float,
+        upper: float,
+        length: float,
+        preferred: float,
+        placed_intervals: List[Tuple[float, float]],
+    ) -> List[float]:
+        if length <= 0.0 or upper - lower < length - FeasibilityChecker.OVERLAP_EPS:
+            return []
+
+        high = upper - length
+        clipped_preferred = min(max(preferred, lower), high)
+        raw_candidates = {lower, high, clipped_preferred}
+        for start, end in placed_intervals:
+            raw_candidates.add(start - length)
+            raw_candidates.add(end)
+            raw_candidates.add(start)
+            raw_candidates.add(end - length)
+
+        positions: List[float] = []
+        seen = set()
+        for raw in sorted(raw_candidates):
+            pos = min(max(raw, lower), high)
+            key = round(pos, 6)
+            if key in seen:
+                continue
+            seen.add(key)
+            if pos < lower - FeasibilityChecker.OVERLAP_EPS or pos > high + FeasibilityChecker.OVERLAP_EPS:
+                continue
+            overlaps = any(
+                pos < end - FeasibilityChecker.OVERLAP_EPS
+                and pos + length > start + FeasibilityChecker.OVERLAP_EPS
+                for start, end in placed_intervals
+            )
+            if not overlaps:
+                positions.append(pos)
+        return positions
+
+    @classmethod
+    def _rail_unit_origin(
+        cls,
+        edge: str,
+        axis_position: float,
+        unit: ConstructiveUnit,
+        frame_x: float,
+        frame_y: float,
+        frame_width: float,
+        frame_height: float,
+    ) -> Tuple[float, float]:
+        width = cls._valid_unit_width(unit)
+        height = cls._valid_unit_height(unit)
+        if edge == "bottom":
+            return axis_position, frame_y
+        if edge == "top":
+            return axis_position, frame_y + frame_height - height
+        if edge == "left":
+            return frame_x, axis_position
+        return frame_x + frame_width - width, axis_position
+
+    @classmethod
+    def _place_boundary_rail_units(
+        cls,
+        units: List[ConstructiveUnit],
+        edge: str,
+        axis_lower: float,
+        axis_upper: float,
+        frame_x: float,
+        frame_y: float,
+        frame_width: float,
+        frame_height: float,
+        current_origins: Dict[str, Tuple[float, float]],
+        origins: Dict[str, Tuple[float, float]],
+        placed_centers: Dict[int, Tuple[float, float]],
+        connection_index: ConstructiveConnectionIndex,
+    ) -> bool:
+        if not units:
+            return True
+
+        placed_intervals: List[Tuple[float, float]] = []
+        horizontal = edge in {"bottom", "top"}
+        remaining = sorted(
+            units,
+            key=lambda unit: (
+                -cls._unit_frontier_weight(unit, placed_centers, connection_index),
+                -cls._unit_connectivity_weight(unit, connection_index),
+                unit.min_block_id,
+                unit.unit_id,
+            ),
+        )
+
+        for unit in remaining:
+            length = cls._valid_unit_width(unit) if horizontal else cls._valid_unit_height(unit)
+            current_origin = current_origins.get(unit.unit_id, (frame_x, frame_y))
+            preferred = current_origin[0] if horizontal else current_origin[1]
+            best_origin: Optional[Tuple[float, float]] = None
+            best_axis: Optional[float] = None
+            best_key: Optional[Tuple[float, float, float, int, str]] = None
+
+            for axis_position in cls._rail_axis_positions(
+                axis_lower,
+                axis_upper,
+                length,
+                preferred,
+                placed_intervals,
+            ):
+                candidate_origin = cls._rail_unit_origin(
+                    edge,
+                    axis_position,
+                    unit,
+                    frame_x,
+                    frame_y,
+                    frame_width,
+                    frame_height,
+                )
+                connection_cost = cls._site_connection_cost(
+                    unit,
+                    candidate_origin,
+                    None,
+                    (0.0, 0.0),
+                    connection_index,
+                    placed_centers,
+                )
+                displacement = (
+                    abs(candidate_origin[0] - current_origin[0])
+                    + abs(candidate_origin[1] - current_origin[1])
+                )
+                key = (
+                    connection_cost,
+                    displacement,
+                    axis_position,
+                    unit.min_block_id,
+                    unit.unit_id,
+                )
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_axis = axis_position
+                    best_origin = candidate_origin
+
+            if best_axis is None or best_origin is None:
+                return False
+
+            origins[unit.unit_id] = best_origin
+            placed_intervals.append((best_axis, best_axis + length))
+            placed_centers.update(cls._unit_block_centers_at_origin(unit, best_origin))
+
+        return True
+
+    @classmethod
+    def _site_connection_cost(
+        cls,
+        unit: ConstructiveUnit,
+        origin: Tuple[float, float],
+        local_bbox: Optional[Tuple[float, float, float, float]],
+        global_offset: Tuple[float, float],
+        connection_index: ConstructiveConnectionIndex,
+        placed_centers: Dict[int, Tuple[float, float]],
+    ) -> float:
+        expanded = cls._expand_unit(unit, origin)
+        expanded_bbox = None
+        if local_bbox is not None:
+            offset_x, offset_y = global_offset
+            expanded_bbox = (
+                local_bbox[0] + offset_x,
+                local_bbox[1] + offset_y,
+                local_bbox[2] + offset_x,
+                local_bbox[3] + offset_y,
+            )
+        else:
+            for rect in expanded.values():
+                expanded_bbox = AnchorAwareLegalizer._expanded_bbox(expanded_bbox, rect)
+        return cls._connection_cost(
+            unit,
+            expanded,
+            expanded_bbox,
+            connection_index,
+            placed_centers,
+        )
+
+    @staticmethod
+    def _unit_block_centers_at_origin(
+        unit: ConstructiveUnit,
+        origin: Tuple[float, float],
+    ) -> Dict[int, Tuple[float, float]]:
+        origin_x, origin_y = origin
+        return {
+            block_id: (
+                origin_x + local_rect[0] + local_rect[2] / 2.0,
+                origin_y + local_rect[1] + local_rect[3] / 2.0,
+            )
+            for block_id, local_rect in unit.local_rects.items()
+        }
+
+    @classmethod
+    def _unit_frontier_weight(
+        cls,
+        unit: ConstructiveUnit,
+        placed_centers: Dict[int, Tuple[float, float]],
+        connection_index: ConstructiveConnectionIndex,
+    ) -> float:
+        if not placed_centers:
+            return 0.0
+        placed_ids = set(placed_centers)
+        return sum(
+            weight
+            for block_id in unit.block_ids
+            for other_id, weight in connection_index.b2b_neighbors.get(block_id, ())
+            if other_id in placed_ids
+        )
+
+    @staticmethod
+    def _unit_pin_weight(
+        unit: ConstructiveUnit,
+        connection_index: ConstructiveConnectionIndex,
+    ) -> float:
+        return sum(
+            weight
+            for block_id in unit.block_ids
+            for _, _, weight in connection_index.p2b_targets.get(block_id, ())
+        )
+
+    @staticmethod
+    def _unit_connectivity_weight(
+        unit: ConstructiveUnit,
+        connection_index: ConstructiveConnectionIndex,
+    ) -> float:
+        b2b_weight = sum(
+            weight
+            for block_id in unit.block_ids
+            for _, weight in connection_index.b2b_neighbors.get(block_id, ())
+        )
+        p2b_weight = sum(
+            weight
+            for block_id in unit.block_ids
+            for _, _, weight in connection_index.p2b_targets.get(block_id, ())
+        )
+        return b2b_weight + p2b_weight
+
+    @classmethod
+    def _unit_origin_map_from_positions(
+        cls,
+        units: List[ConstructiveUnit],
+        positions: Optional[List[Tuple[float, float, float, float]]],
+    ) -> Dict[str, Tuple[float, float]]:
+        origins: Dict[str, Tuple[float, float]] = {}
+        if positions is None:
+            return origins
+        for unit in units:
+            for block_id in unit.block_ids:
+                if block_id >= len(positions) or block_id not in unit.local_rects:
+                    continue
+                x, y, _, _ = positions[block_id]
+                local_x, local_y, _, _ = unit.local_rects[block_id]
+                if math.isfinite(x) and math.isfinite(y):
+                    origins[unit.unit_id] = (x - local_x, y - local_y)
+                    break
+        return origins
+
+    @staticmethod
+    def _positions_width(
+        positions: Optional[List[Tuple[float, float, float, float]]],
+    ) -> Optional[float]:
+        if not positions:
+            return None
+        min_x = min(rect[0] for rect in positions)
+        max_x = max(rect[0] + rect[2] for rect in positions)
+        width = max_x - min_x
+        return width if math.isfinite(width) and width > 0.0 else None
 
     @classmethod
     def _shelf_width_for_units(
