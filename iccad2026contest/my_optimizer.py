@@ -2617,6 +2617,33 @@ class MyOptimizer(FloorplanOptimizer):
         for candidate_index, (source, positions) in enumerate(constructive_candidates, start=1):
             candidate_positions.append((source, candidate_index, positions))
 
+        next_candidate_index = max(
+            (source_order for _, source_order, _ in candidate_positions),
+            default=0,
+        )
+        if guidance.available and (guidance.predicted_positions or guidance.predicted_centers):
+            neutral_guidance = Guidance(
+                order=list(problem.movables),
+                predicted_centers={},
+                predicted_positions={},
+                available=False,
+                warnings=["constructive_neutral_ignores_model_predictions"],
+            )
+            try:
+                neutral_candidates = ConstructiveCandidateLegalizer.build_candidates(problem, neutral_guidance)
+            except (IndexError, RuntimeError, TypeError, ValueError) as exc:
+                neutral_candidates = []
+                if self.verbose:
+                    print(f"--> Neutral constructive candidate path skipped: {type(exc).__name__}")
+
+            for source, positions in neutral_candidates:
+                next_candidate_index += 1
+                if source.startswith("constructive:"):
+                    neutral_source = source.replace("constructive:", "constructive_neutral:", 1)
+                else:
+                    neutral_source = f"constructive_neutral:{source}"
+                candidate_positions.append((neutral_source, next_candidate_index, positions))
+
         best_candidate = CandidateSelector.best_feasible(
             problem,
             candidate_positions,
