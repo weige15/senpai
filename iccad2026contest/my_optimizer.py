@@ -1578,6 +1578,8 @@ class ConstructiveCandidateLegalizer:
     MAX_CANDIDATES_PER_UNIT = 96
     PROXY_SOFT_WEIGHT = 1000.0
     PROXY_BBOX_WEIGHT = 0.01
+    BOUNDARY_FRAME_GAP = 1.0
+    BOUNDARY_FRAME_ASPECT = 1.5
 
     @classmethod
     def build_candidates(
@@ -1596,6 +1598,13 @@ class ConstructiveCandidateLegalizer:
             if state.failed or not state.is_complete:
                 continue
             positions = state.as_positions(problem)
+            signature = cls._positions_signature(positions)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            candidates.append((source, positions))
+
+        for source, positions in cls._boundary_frame_candidates(problem, units):
             signature = cls._positions_signature(positions)
             if signature in seen:
                 continue
@@ -1763,11 +1772,404 @@ class ConstructiveCandidateLegalizer:
         return 2
 
     @classmethod
+    def _boundary_frame_candidates(
+        cls,
+        problem: NormalizedProblem,
+        units: List[ConstructiveUnit],
+    ) -> List[Tuple[str, List[Tuple[float, float, float, float]]]]:
+        if not any(unit.boundary_mask for unit in units):
+            return []
+
+        ordered_units = sorted(units, key=lambda unit: (
+            cls._boundary_bucket(unit.boundary_mask),
+            -unit.area,
+            unit.guidance_rank,
+            unit.min_block_id,
+            unit.unit_id,
+        ))
+        positions = cls._boundary_frame_candidate(problem, ordered_units)
+        if positions is None:
+            return []
+        return [("constructive:boundary_frame_structured", positions)]
+
+    @classmethod
+    def _boundary_frame_candidate(
+        cls,
+        problem: NormalizedProblem,
+        ordered_units: List[ConstructiveUnit],
+    ) -> Optional[List[Tuple[float, float, float, float]]]:
+        state = cls._initial_state_with_anchors(problem)
+        if state.failed:
+            return None
+
+        groups = cls._boundary_frame_groups(ordered_units)
+        corners = {
+            name: values[0] if values else None
+            for name, values in (
+                ("top_left", groups["top_left"]),
+                ("top_right", groups["top_right"]),
+                ("bottom_left", groups["bottom_left"]),
+                ("bottom_right", groups["bottom_right"]),
+            )
+        }
+        left_units = groups["left"]
+        right_units = groups["right"]
+        top_units = groups["top"]
+        bottom_units = groups["bottom"]
+        interior_units = groups["interior"]
+
+        left_width = max(
+            cls._max_unit_width(left_units),
+            cls._valid_unit_width(corners["top_left"]) if corners["top_left"] else 0.0,
+            cls._valid_unit_width(corners["bottom_left"]) if corners["bottom_left"] else 0.0,
+        )
+        right_width = max(
+            cls._max_unit_width(right_units),
+            cls._valid_unit_width(corners["top_right"]) if corners["top_right"] else 0.0,
+            cls._valid_unit_width(corners["bottom_right"]) if corners["bottom_right"] else 0.0,
+        )
+        top_height = cls._max_unit_height(top_units)
+        bottom_height = cls._max_unit_height(bottom_units)
+
+        interior_width_hint = cls._shelf_width_for_units(
+            interior_units,
+            cls.BOUNDARY_FRAME_ASPECT,
+        )
+        rail_central_width = max(
+            cls._sum_unit_widths(top_units),
+            cls._sum_unit_widths(bottom_units),
+        )
+        central_width = max(interior_width_hint, rail_central_width)
+        if interior_units and central_width <= 0.0:
+            central_width = cls._max_unit_width(interior_units)
+
+        relative_interior_origins, interior_width, interior_height = cls._pack_shelf_unit_origins(
+            interior_units,
+            central_width if central_width > 0.0 else None,
+        )
+        central_width = max(central_width, rail_central_width, interior_width)
+
+        central_column_height = bottom_height + interior_height + top_height
+        left_column_height = (
+            (cls._valid_unit_height(corners["bottom_left"]) if corners["bottom_left"] else 0.0)
+            + cls._sum_unit_heights(left_units)
+            + (cls._valid_unit_height(corners["top_left"]) if corners["top_left"] else 0.0)
+        )
+        right_column_height = (
+            (cls._valid_unit_height(corners["bottom_right"]) if corners["bottom_right"] else 0.0)
+            + cls._sum_unit_heights(right_units)
+            + (cls._valid_unit_height(corners["top_right"]) if corners["top_right"] else 0.0)
+        )
+
+        frame_width = max(left_width + central_width + right_width, 1.0)
+        frame_height = max(central_column_height, left_column_height, right_column_height, 1.0)
+        anchor_bbox = AnchorAwareLegalizer._bbox(state.occupied)
+        frame_x = cls._boundary_frame_x_origin(anchor_bbox, frame_width, ordered_units)
+        frame_y, frame_height = cls._boundary_frame_y_origin_and_height(anchor_bbox, frame_height)
+        central_x = frame_x + left_width
+
+        origins: Dict[str, Tuple[float, float]] = {}
+        for unit_id, (local_x, local_y) in relative_interior_origins.items():
+            origins[unit_id] = (central_x + local_x, frame_y + bottom_height + local_y)
+
+        x_cursor = central_x
+        for unit in bottom_units:
+            origins[unit.unit_id] = (x_cursor, frame_y)
+            x_cursor += cls._valid_unit_width(unit)
+
+        x_cursor = central_x
+        for unit in top_units:
+            origins[unit.unit_id] = (
+                x_cursor,
+                frame_y + frame_height - cls._valid_unit_height(unit),
+            )
+            x_cursor += cls._valid_unit_width(unit)
+
+        y_cursor = frame_y + (
+            cls._valid_unit_height(corners["bottom_left"])
+            if corners["bottom_left"] else 0.0
+        )
+        for unit in left_units:
+            origins[unit.unit_id] = (frame_x, y_cursor)
+            y_cursor += cls._valid_unit_height(unit)
+
+        y_cursor = frame_y + (
+            cls._valid_unit_height(corners["bottom_right"])
+            if corners["bottom_right"] else 0.0
+        )
+        for unit in right_units:
+            origins[unit.unit_id] = (
+                frame_x + frame_width - cls._valid_unit_width(unit),
+                y_cursor,
+            )
+            y_cursor += cls._valid_unit_height(unit)
+
+        if corners["bottom_left"] is not None:
+            origins[corners["bottom_left"].unit_id] = (frame_x, frame_y)
+        if corners["bottom_right"] is not None:
+            unit = corners["bottom_right"]
+            origins[unit.unit_id] = (
+                frame_x + frame_width - cls._valid_unit_width(unit),
+                frame_y,
+            )
+        if corners["top_left"] is not None:
+            unit = corners["top_left"]
+            origins[unit.unit_id] = (
+                frame_x,
+                frame_y + frame_height - cls._valid_unit_height(unit),
+            )
+        if corners["top_right"] is not None:
+            unit = corners["top_right"]
+            origins[unit.unit_id] = (
+                frame_x + frame_width - cls._valid_unit_width(unit),
+                frame_y + frame_height - cls._valid_unit_height(unit),
+            )
+
+        if not cls._apply_unit_origins(state, ordered_units, origins):
+            return None
+        if state.failed or not state.is_complete:
+            return None
+        return state.as_positions(problem)
+
+    @classmethod
+    def _boundary_frame_groups(
+        cls,
+        ordered_units: List[ConstructiveUnit],
+    ) -> Dict[str, List[ConstructiveUnit]]:
+        groups: Dict[str, List[ConstructiveUnit]] = {
+            "top_left": [],
+            "top_right": [],
+            "bottom_left": [],
+            "bottom_right": [],
+            "left": [],
+            "right": [],
+            "top": [],
+            "bottom": [],
+            "interior": [],
+        }
+        for unit in ordered_units:
+            groups[cls._boundary_frame_bucket(unit)].append(unit)
+
+        corner_extras = {
+            "top_left": "left",
+            "bottom_left": "left",
+            "top_right": "right",
+            "bottom_right": "right",
+        }
+        for corner, side in corner_extras.items():
+            if len(groups[corner]) <= 1:
+                continue
+            groups[side].extend(groups[corner][1:])
+            del groups[corner][1:]
+        return groups
+
+    @staticmethod
+    def _boundary_frame_bucket(unit: ConstructiveUnit) -> str:
+        mask = int(unit.boundary_mask)
+        if mask == 0:
+            return "interior"
+
+        wants_left = bool(mask & 1)
+        wants_right = bool(mask & 2)
+        wants_top = bool(mask & 4)
+        wants_bottom = bool(mask & 8)
+
+        if (wants_left or wants_right) and (wants_top or wants_bottom):
+            horizontal = "left" if wants_left else "right"
+            vertical = "bottom" if wants_bottom else "top"
+            return f"{vertical}_{horizontal}"
+        if wants_left:
+            return "left"
+        if wants_right:
+            return "right"
+        if wants_bottom:
+            return "bottom"
+        if wants_top:
+            return "top"
+        return "interior"
+
+    @classmethod
+    def _pack_shelf_unit_origins(
+        cls,
+        units: List[ConstructiveUnit],
+        shelf_width: Optional[float],
+    ) -> Tuple[Dict[str, Tuple[float, float]], float, float]:
+        origins: Dict[str, Tuple[float, float]] = {}
+        x_origin = 0.0
+        y_origin = 0.0
+        x_cursor = x_origin
+        y_cursor = y_origin
+        row_height = 0.0
+        max_x = x_origin
+        max_y = y_origin
+
+        for unit in units:
+            width = cls._valid_unit_width(unit)
+            height = cls._valid_unit_height(unit)
+            if (
+                shelf_width is not None
+                and row_height > 0.0
+                and x_cursor > x_origin
+                and x_cursor + width > x_origin + shelf_width + FeasibilityChecker.OVERLAP_EPS
+            ):
+                x_cursor = x_origin
+                y_cursor += row_height
+                row_height = 0.0
+
+            origins[unit.unit_id] = (x_cursor, y_cursor)
+            x_cursor += width
+            row_height = max(row_height, height)
+            max_x = max(max_x, x_cursor)
+            max_y = max(max_y, y_cursor + height)
+
+        return origins, max_x - x_origin, max_y - y_origin
+
+    @classmethod
+    def _shelf_width_for_units(
+        cls,
+        units: List[ConstructiveUnit],
+        aspect: float,
+    ) -> float:
+        if not units:
+            return 0.0
+        total_area = sum(unit.area for unit in units)
+        max_width = cls._max_unit_width(units)
+        if total_area <= 0.0 or not math.isfinite(total_area):
+            return max_width
+        return max(max_width, math.sqrt(total_area) * aspect)
+
+    @staticmethod
+    def _sum_unit_widths(units: List[ConstructiveUnit]) -> float:
+        return sum(ConstructiveCandidateLegalizer._valid_unit_width(unit) for unit in units)
+
+    @staticmethod
+    def _sum_unit_heights(units: List[ConstructiveUnit]) -> float:
+        return sum(ConstructiveCandidateLegalizer._valid_unit_height(unit) for unit in units)
+
+    @staticmethod
+    def _max_unit_width(units: List[ConstructiveUnit]) -> float:
+        return max(
+            (ConstructiveCandidateLegalizer._valid_unit_width(unit) for unit in units),
+            default=0.0,
+        )
+
+    @staticmethod
+    def _max_unit_height(units: List[ConstructiveUnit]) -> float:
+        return max(
+            (ConstructiveCandidateLegalizer._valid_unit_height(unit) for unit in units),
+            default=0.0,
+        )
+
+    @staticmethod
+    def _valid_unit_width(unit: Optional[ConstructiveUnit]) -> float:
+        if unit is None:
+            return 0.0
+        width = float(unit.width)
+        return width if math.isfinite(width) and width > 0.0 else 1.0
+
+    @staticmethod
+    def _valid_unit_height(unit: Optional[ConstructiveUnit]) -> float:
+        if unit is None:
+            return 0.0
+        height = float(unit.height)
+        return height if math.isfinite(height) and height > 0.0 else 1.0
+
+    @classmethod
+    def _boundary_frame_x_origin(
+        cls,
+        anchor_bbox: Optional[Tuple[float, float, float, float]],
+        frame_width: float,
+        units: List[ConstructiveUnit],
+    ) -> float:
+        if anchor_bbox is None:
+            return 0.0
+
+        left_requests = sum(1 for unit in units if unit.boundary_mask & 1)
+        right_requests = sum(1 for unit in units if unit.boundary_mask & 2)
+        min_x, _, max_x, _ = anchor_bbox
+        if left_requests > right_requests:
+            return min(0.0, min_x) - frame_width - cls.BOUNDARY_FRAME_GAP
+        return max(0.0, max_x + cls.BOUNDARY_FRAME_GAP)
+
+    @classmethod
+    def _boundary_frame_y_origin_and_height(
+        cls,
+        anchor_bbox: Optional[Tuple[float, float, float, float]],
+        frame_height: float,
+    ) -> Tuple[float, float]:
+        if anchor_bbox is None:
+            return 0.0, frame_height
+
+        _, min_y, _, max_y = anchor_bbox
+        y_origin = min(0.0, min_y)
+        return y_origin, max(frame_height, max_y - y_origin)
+
+    @classmethod
+    def _apply_unit_origins(
+        cls,
+        state: PlacementState,
+        ordered_units: List[ConstructiveUnit],
+        origins: Dict[str, Tuple[float, float]],
+    ) -> bool:
+        for unit in ordered_units:
+            origin = origins.get(unit.unit_id)
+            if origin is None:
+                state.failed = True
+                state.warnings.append(f"boundary_frame_missing_origin:{unit.unit_id}")
+                return False
+            expanded = cls._expand_unit(unit, origin)
+            if not cls._unit_rects_are_valid(expanded):
+                state.failed = True
+                state.warnings.append(f"boundary_frame_invalid_rect:{unit.unit_id}")
+                return False
+            if cls._unit_has_internal_overlap(expanded):
+                state.failed = True
+                state.warnings.append(f"boundary_frame_internal_overlap:{unit.unit_id}")
+                return False
+            if cls._unit_overlaps_occupied(expanded, state.occupied):
+                state.failed = True
+                state.warnings.append(f"boundary_frame_overlap:{unit.unit_id}")
+                return False
+            for block_id in sorted(expanded):
+                rect = expanded[block_id]
+                state.positions[block_id] = rect
+                state.occupied.append((block_id, rect))
+                state.placed_order.append(block_id)
+        return True
+
+    @classmethod
     def _legalize_order(
         cls,
         problem: NormalizedProblem,
         guidance: Guidance,
         units: List[ConstructiveUnit],
+    ) -> PlacementState:
+        state = cls._initial_state_with_anchors(problem)
+
+        for unit in units:
+            if all(state.positions[block_id] is not None for block_id in unit.block_ids):
+                continue
+            origin = cls._choose_unit_origin(problem, unit, state, guidance)
+            if origin is None:
+                state.failed = True
+                state.warnings.append(f"unit_{unit.unit_id}_no_legal_candidate")
+                continue
+            expanded = cls._expand_unit(unit, origin)
+            for block_id in sorted(expanded):
+                rect = expanded[block_id]
+                state.positions[block_id] = rect
+                state.occupied.append((block_id, rect))
+                state.placed_order.append(block_id)
+
+        if not state.is_complete:
+            state.failed = True
+            state.warnings.append("constructive_placement_incomplete")
+        return state
+
+    @classmethod
+    def _initial_state_with_anchors(
+        cls,
+        problem: NormalizedProblem,
     ) -> PlacementState:
         state = PlacementState(
             positions=[None] * problem.block_count,
@@ -1797,25 +2199,6 @@ class ConstructiveCandidateLegalizer:
             state.positions[block_id] = rect
             state.occupied.append((block_id, rect))
             state.placed_order.append(block_id)
-
-        for unit in units:
-            if all(state.positions[block_id] is not None for block_id in unit.block_ids):
-                continue
-            origin = cls._choose_unit_origin(problem, unit, state, guidance)
-            if origin is None:
-                state.failed = True
-                state.warnings.append(f"unit_{unit.unit_id}_no_legal_candidate")
-                continue
-            expanded = cls._expand_unit(unit, origin)
-            for block_id in sorted(expanded):
-                rect = expanded[block_id]
-                state.positions[block_id] = rect
-                state.occupied.append((block_id, rect))
-                state.placed_order.append(block_id)
-
-        if not state.is_complete:
-            state.failed = True
-            state.warnings.append("constructive_placement_incomplete")
         return state
 
     @classmethod
