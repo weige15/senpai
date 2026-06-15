@@ -334,6 +334,12 @@ def parse_args():
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--noise-std", type=float, default=5.0)
+    parser.add_argument(
+        "--grad-clip",
+        type=float,
+        default=1.0,
+        help="Max gradient norm before optimizer step. Use 0 to disable.",
+    )
     parser.add_argument("--max-blocks", type=int, default=1000)
     parser.add_argument("--save-freq-batches", type=int, default=10)
     parser.add_argument("--log-freq", type=int, default=1)
@@ -717,9 +723,19 @@ def main():
                         continue
 
                 scaler.scale(batch_loss).backward()
+                if args.grad_clip > 0:
+                    if amp_enabled:
+                        scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
+                scale_before_step = scaler.get_scale() if amp_enabled else None
                 scaler.step(optimizer)
                 scaler.update()
-                scheduler.step()
+                optimizer_step_skipped = (
+                    amp_enabled and scaler.get_scale() < scale_before_step
+                )
+                if not optimizer_step_skipped:
+                    scheduler.step()
 
                 global_step += 1
                 processed_batches += 1
