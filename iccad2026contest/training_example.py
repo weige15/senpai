@@ -817,9 +817,11 @@ def main():
 
                 scaler.scale(batch_loss).backward()
                 grad_norm = None
+                gradients_unscaled = False
                 if args.grad_clip > 0:
                     if amp_enabled:
                         scaler.unscale_(optimizer)
+                        gradients_unscaled = True
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
                 local_grad_ok = True
@@ -832,6 +834,9 @@ def main():
                         rank,
                         f"  Batch [{batch_idx + 1}/{len(dataloader)}] skipped: non-finite gradients",
                     )
+                    if amp_enabled and gradients_unscaled:
+                        # Reset GradScaler state after unscale_ even when this batch is skipped.
+                        scaler.update()
                     optimizer.zero_grad(set_to_none=True)
                     continue
 
