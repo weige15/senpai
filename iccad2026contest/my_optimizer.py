@@ -1574,6 +1574,12 @@ class CandidateChoice:
     key: Tuple[float, float, float, float, float, int]
 
 
+@dataclass
+class ConstructiveConnectionIndex:
+    b2b_neighbors: Dict[int, Tuple[Tuple[int, float], ...]]
+    p2b_targets: Dict[int, Tuple[Tuple[float, float, float], ...]]
+
+
 class ConstructiveCandidateLegalizer:
     ROUND_DIGITS = 9
     MAX_CANDIDATES_PER_UNIT = 96
@@ -1581,6 +1587,8 @@ class ConstructiveCandidateLegalizer:
     PROXY_BBOX_WEIGHT = 0.01
     BOUNDARY_FRAME_GAP = 1.0
     BOUNDARY_FRAME_ASPECT = 1.5
+    CONNECTION_SCORE_WEIGHT = 0.35
+    CONNECTION_SCORE_CAP = 4.0
 
     @classmethod
     def build_candidates(
@@ -1594,8 +1602,9 @@ class ConstructiveCandidateLegalizer:
 
         candidates: List[Tuple[str, List[Tuple[float, float, float, float]]]] = []
         seen = set()
+        connection_index = cls._build_connection_index(problem)
         for source, ordered_units in cls._order_variants(units):
-            state = cls._legalize_order(problem, guidance, ordered_units)
+            state = cls._legalize_order(problem, guidance, ordered_units, connection_index)
             if state.failed or not state.is_complete:
                 continue
             positions = state.as_positions(problem)
@@ -2144,13 +2153,20 @@ class ConstructiveCandidateLegalizer:
         problem: NormalizedProblem,
         guidance: Guidance,
         units: List[ConstructiveUnit],
+        connection_index: ConstructiveConnectionIndex,
     ) -> PlacementState:
         state = cls._initial_state_with_anchors(problem)
 
         for unit in units:
             if all(state.positions[block_id] is not None for block_id in unit.block_ids):
                 continue
-            origin = cls._choose_unit_origin(problem, unit, state, guidance)
+            origin = cls._choose_unit_origin(
+                problem,
+                unit,
+                state,
+                guidance,
+                connection_index,
+            )
             if origin is None:
                 state.failed = True
                 state.warnings.append(f"unit_{unit.unit_id}_no_legal_candidate")
@@ -2209,9 +2225,11 @@ class ConstructiveCandidateLegalizer:
         unit: ConstructiveUnit,
         state: PlacementState,
         guidance: Guidance,
+        connection_index: ConstructiveConnectionIndex,
     ) -> Optional[Tuple[float, float]]:
-        best_key: Optional[Tuple[float, float, float, float, float, float, str]] = None
+        best_key: Optional[Tuple[float, float, float, float, float, float, float, str]] = None
         best_origin: Optional[Tuple[float, float]] = None
+        placed_centers = cls._placed_centers(state)
 
         for origin in cls._generate_unit_origins(unit, state):
             expanded = cls._expand_unit(unit, origin)
@@ -2222,7 +2240,16 @@ class ConstructiveCandidateLegalizer:
             if cls._unit_overlaps_occupied(expanded, state.occupied):
                 continue
 
-            score = cls._score_unit_origin(problem, unit, origin, expanded, state, guidance)
+            score = cls._score_unit_origin(
+                problem,
+                unit,
+                origin,
+                expanded,
+                state,
+                guidance,
+                connection_index,
+                placed_centers,
+            )
             if best_key is None or score < best_key:
                 best_key = score
                 best_origin = origin
@@ -2366,7 +2393,9 @@ class ConstructiveCandidateLegalizer:
         expanded: Dict[int, Tuple[float, float, float, float]],
         state: PlacementState,
         guidance: Guidance,
-    ) -> Tuple[float, float, float, float, float, float, str]:
+        connection_index: ConstructiveConnectionIndex,
+        placed_centers: Dict[int, Tuple[float, float]],
+    ) -> Tuple[float, float, float, float, float, float, float, str]:
         current_bbox = AnchorAwareLegalizer._bbox(state.occupied)
         expanded_bbox = current_bbox
         for rect in expanded.values():
@@ -2375,10 +2404,22 @@ class ConstructiveCandidateLegalizer:
         current_area = AnchorAwareLegalizer._bbox_area(current_bbox)
         expanded_area = AnchorAwareLegalizer._bbox_area(expanded_bbox)
         area_growth = max(0.0, expanded_area - current_area)
+        area_scale = max(current_area, unit.area, 1.0)
+        normalized_area_growth = area_growth / area_scale
 
         boundary_miss = cls._unit_boundary_miss(unit, expanded, expanded_bbox)
         predicted_distance = cls._predicted_distance(unit, expanded, guidance)
-        connection_cost = 0.0
+        connection_cost = cls._connection_cost(
+            unit,
+            expanded,
+            expanded_bbox,
+            connection_index,
+            placed_centers,
+        )
+        placement_quality = (
+            normalized_area_growth
+            + cls.CONNECTION_SCORE_WEIGHT * connection_cost
+        )
         coordinate_bias = abs(origin[0]) + abs(origin[1])
         span = 0.0
         if expanded_bbox is not None:
@@ -2386,6 +2427,7 @@ class ConstructiveCandidateLegalizer:
 
         return (
             round(boundary_miss, cls.ROUND_DIGITS),
+            round(placement_quality, cls.ROUND_DIGITS),
             round(area_growth, cls.ROUND_DIGITS),
             round(connection_cost, cls.ROUND_DIGITS),
             round(predicted_distance, cls.ROUND_DIGITS),
@@ -2393,6 +2435,181 @@ class ConstructiveCandidateLegalizer:
             round(origin[1], cls.ROUND_DIGITS),
             unit.unit_id,
         )
+
+    @classmethod
+    def _build_connection_index(
+        cls,
+        problem: NormalizedProblem,
+    ) -> ConstructiveConnectionIndex:
+        b2b_neighbors: Dict[int, List[Tuple[int, float]]] = {}
+        for edge in cls._iter_edge_rows(problem.b2b_connectivity):
+            first = cls._edge_int(edge, 0)
+            second = cls._edge_int(edge, 1)
+            weight = cls._edge_float(edge, 2)
+            if (
+                first is None
+                or second is None
+                or weight is None
+                or first < 0
+                or second < 0
+                or first >= problem.block_count
+                or second >= problem.block_count
+            ):
+                continue
+            edge_weight = abs(weight)
+            if edge_weight <= 0.0 or not math.isfinite(edge_weight):
+                continue
+            b2b_neighbors.setdefault(first, []).append((second, edge_weight))
+            b2b_neighbors.setdefault(second, []).append((first, edge_weight))
+
+        p2b_targets: Dict[int, List[Tuple[float, float, float]]] = {}
+        pin_count = cls._pin_count(problem.pins_pos)
+        for edge in cls._iter_edge_rows(problem.p2b_connectivity):
+            pin_id = cls._edge_int(edge, 0)
+            block_id = cls._edge_int(edge, 1)
+            weight = cls._edge_float(edge, 2)
+            if (
+                pin_id is None
+                or block_id is None
+                or weight is None
+                or pin_id < 0
+                or block_id < 0
+                or pin_id >= pin_count
+                or block_id >= problem.block_count
+            ):
+                continue
+            pin = cls._pin_position(problem.pins_pos, pin_id)
+            if pin is None:
+                continue
+            edge_weight = abs(weight)
+            if edge_weight <= 0.0 or not math.isfinite(edge_weight):
+                continue
+            p2b_targets.setdefault(block_id, []).append((pin[0], pin[1], edge_weight))
+
+        return ConstructiveConnectionIndex(
+            b2b_neighbors={
+                block_id: tuple(neighbors)
+                for block_id, neighbors in b2b_neighbors.items()
+            },
+            p2b_targets={
+                block_id: tuple(targets)
+                for block_id, targets in p2b_targets.items()
+            },
+        )
+
+    @staticmethod
+    def _iter_edge_rows(edges: Optional[torch.Tensor]):
+        if edges is None:
+            return
+        try:
+            for edge in edges:
+                try:
+                    if len(edge) < 3:
+                        continue
+                except TypeError:
+                    continue
+                yield edge
+        except TypeError:
+            return
+
+    @staticmethod
+    def _edge_float(edge, index: int) -> Optional[float]:
+        try:
+            value = float(edge[index])
+        except (IndexError, RuntimeError, TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    @classmethod
+    def _edge_int(cls, edge, index: int) -> Optional[int]:
+        value = cls._edge_float(edge, index)
+        if value is None:
+            return None
+        return int(value)
+
+    @staticmethod
+    def _pin_count(pins_pos: Optional[torch.Tensor]) -> int:
+        if pins_pos is None:
+            return 0
+        try:
+            return len(pins_pos)
+        except TypeError:
+            return 0
+
+    @classmethod
+    def _pin_position(
+        cls,
+        pins_pos: Optional[torch.Tensor],
+        pin_id: int,
+    ) -> Optional[Tuple[float, float]]:
+        if pins_pos is None:
+            return None
+        try:
+            px = float(pins_pos[pin_id][0])
+            py = float(pins_pos[pin_id][1])
+        except (IndexError, RuntimeError, TypeError, ValueError):
+            return None
+        if not math.isfinite(px) or not math.isfinite(py):
+            return None
+        return px, py
+
+    @staticmethod
+    def _placed_centers(state: PlacementState) -> Dict[int, Tuple[float, float]]:
+        return {
+            block_id: (rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0)
+            for block_id, rect in state.occupied
+        }
+
+    @classmethod
+    def _connection_cost(
+        cls,
+        unit: ConstructiveUnit,
+        expanded: Dict[int, Tuple[float, float, float, float]],
+        expanded_bbox: Optional[Tuple[float, float, float, float]],
+        connection_index: ConstructiveConnectionIndex,
+        placed_centers: Dict[int, Tuple[float, float]],
+    ) -> float:
+        if not connection_index.b2b_neighbors and not connection_index.p2b_targets:
+            return 0.0
+
+        unit_blocks = set(unit.block_ids)
+        total = 0.0
+        total_weight = 0.0
+        for block_id, rect in expanded.items():
+            center_x = rect[0] + rect[2] / 2.0
+            center_y = rect[1] + rect[3] / 2.0
+
+            for other_id, weight in connection_index.b2b_neighbors.get(block_id, ()):
+                if other_id in unit_blocks or other_id not in placed_centers:
+                    continue
+                other_x, other_y = placed_centers[other_id]
+                total += weight * (abs(other_x - center_x) + abs(other_y - center_y))
+                total_weight += weight
+
+            for pin_x, pin_y, weight in connection_index.p2b_targets.get(block_id, ()):
+                total += weight * (abs(pin_x - center_x) + abs(pin_y - center_y))
+                total_weight += weight
+
+        if total_weight <= 0.0:
+            return 0.0
+
+        average_distance = total / total_weight
+        distance_scale = cls._connection_distance_scale(unit, expanded_bbox)
+        normalized = average_distance / distance_scale
+        if not math.isfinite(normalized) or normalized <= 0.0:
+            return 0.0
+        return min(cls.CONNECTION_SCORE_CAP, normalized)
+
+    @staticmethod
+    def _connection_distance_scale(
+        unit: ConstructiveUnit,
+        bbox: Optional[Tuple[float, float, float, float]],
+    ) -> float:
+        span = 0.0
+        if bbox is not None:
+            span = max(0.0, bbox[2] - bbox[0]) + max(0.0, bbox[3] - bbox[1])
+        unit_span = max(0.0, float(unit.width)) + max(0.0, float(unit.height))
+        return max(span, unit_span, math.sqrt(max(unit.area, 1.0)), 1.0)
 
     @staticmethod
     def _unit_boundary_miss(
