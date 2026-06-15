@@ -1925,8 +1925,13 @@ def main():
                        help='Quick mode (skip some checks)')
     parser.add_argument('--save-solutions', '-s', action='store_true',
                        help='Save solutions (positions) to separate file')
+    parser.add_argument('--checkpoint', default=None,
+                       help='Optional optimizer checkpoint path or filename')
     
     args = parser.parse_args()
+
+    if args.checkpoint:
+        os.environ['MY_OPTIMIZER_CHECKPOINT'] = args.checkpoint
     
     if args.info:
         print_contest_info()

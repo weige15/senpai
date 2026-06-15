@@ -10,6 +10,7 @@ ICCAD 2026 FloorSet Challenge - Edge-GNN + DiT-Small + Hybrid B*-tree Contour Le
 """
 
 import math
+import os
 import random
 import re
 import sys
@@ -2848,6 +2849,9 @@ class BStarTreeLegalizer:
 # 6. 主優化器類別 (MyOptimizer)
 # =============================================================================
 
+CHECKPOINT_ENV_VAR = "MY_OPTIMIZER_CHECKPOINT"
+
+
 def checkpoint_step_from_name(path: Path) -> int:
     step_match = re.search(r"step_(\d+)", path.name)
     if step_match:
@@ -2887,19 +2891,58 @@ def state_dict_is_finite(state_dict) -> bool:
     return True
 
 
+def normalize_checkpoint_state(checkpoint):
+    if isinstance(checkpoint, dict):
+        for key in ("model_state_dict", "state_dict", "model"):
+            value = checkpoint.get(key)
+            if isinstance(value, dict):
+                return value
+    return checkpoint
+
+
+def requested_checkpoint_candidates(weight_path: Path) -> List[Path]:
+    checkpoint_arg = os.environ.get(CHECKPOINT_ENV_VAR)
+    if not checkpoint_arg:
+        return []
+
+    candidates: List[Path] = []
+    requested = Path(checkpoint_arg).expanduser()
+    if requested.is_absolute() or requested.parent != Path("."):
+        candidates.append(requested)
+    else:
+        candidates.append(weight_path / requested)
+        candidates.append(requested)
+
+    unique_candidates: List[Path] = []
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.is_file():
+            unique_candidates.append(candidate)
+    return unique_candidates
+
+
 def load_latest_finite_checkpoint(model, weight_path: Path, device, verbose: bool = False):
     if not weight_path.exists():
         return None
 
-    candidates = [
+    preferred = requested_checkpoint_candidates(weight_path)
+    preferred_names = {path.name for path in preferred}
+    fallback = [
         path for path in weight_path.glob("*.pth")
         if checkpoint_loss_is_finite(path)
+        and path.name not in preferred_names
     ]
-    candidates.sort(key=lambda path: (checkpoint_step_from_name(path), path.name), reverse=True)
+    fallback.sort(key=lambda path: (checkpoint_step_from_name(path), path.name), reverse=True)
+    candidates = preferred + fallback
 
     for path in candidates:
         try:
-            state_dict = strip_module_prefix(torch.load(path, map_location=device))
+            checkpoint = torch.load(path, map_location=device)
+            state_dict = strip_module_prefix(normalize_checkpoint_state(checkpoint))
             if not state_dict_is_finite(state_dict):
                 if verbose:
                     print(f"--> WARNING: Skipping non-finite checkpoint: {path.name}")
