@@ -30,3 +30,4 @@ data_lite/
 floorset_lite/
 **/__pycache__/
 floorset_lite
+../my_optimizer.py
