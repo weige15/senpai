@@ -1544,6 +1544,679 @@ class SoftConstraintImprover:
         return unique
 
 
+@dataclass
+class ConstructiveUnit:
+    unit_id: str
+    block_ids: Tuple[int, ...]
+    local_rects: Dict[int, Tuple[float, float, float, float]]
+    width: float
+    height: float
+    boundary_mask: int
+    guidance_rank: int
+    predicted_center: Optional[Tuple[float, float]]
+
+    @property
+    def area(self) -> float:
+        return max(0.0, self.width) * max(0.0, self.height)
+
+    @property
+    def min_block_id(self) -> int:
+        return min(self.block_ids) if self.block_ids else 0
+
+
+@dataclass
+class CandidateChoice:
+    source: str
+    source_order: int
+    positions: List[Tuple[float, float, float, float]]
+    report: FeasibilityReport
+    key: Tuple[float, float, float, float, float, int]
+
+
+class ConstructiveCandidateLegalizer:
+    ROUND_DIGITS = 9
+    MAX_CANDIDATES_PER_UNIT = 96
+    PROXY_SOFT_WEIGHT = 1000.0
+    PROXY_BBOX_WEIGHT = 0.01
+
+    @classmethod
+    def build_candidates(
+        cls,
+        problem: NormalizedProblem,
+        guidance: Guidance,
+    ) -> List[Tuple[str, List[Tuple[float, float, float, float]]]]:
+        units = cls._build_units(problem, guidance)
+        if not units:
+            return []
+
+        candidates: List[Tuple[str, List[Tuple[float, float, float, float]]]] = []
+        seen = set()
+        for source, ordered_units in cls._order_variants(units):
+            state = cls._legalize_order(problem, guidance, ordered_units)
+            if state.failed or not state.is_complete:
+                continue
+            positions = state.as_positions(problem)
+            signature = cls._positions_signature(positions)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            candidates.append((source, positions))
+        return candidates
+
+    @classmethod
+    def _build_units(
+        cls,
+        problem: NormalizedProblem,
+        guidance: Guidance,
+    ) -> List[ConstructiveUnit]:
+        rank_by_block = {
+            block_id: rank
+            for rank, block_id in enumerate(guidance.order)
+        }
+        default_rank = problem.block_count + 1
+        groups: Dict[int, List[int]] = {}
+        for block in problem.blocks:
+            if block.cluster_group is None or block.is_preplaced:
+                continue
+            groups.setdefault(block.cluster_group, []).append(block.index)
+
+        units: List[ConstructiveUnit] = []
+        macro_members = set()
+        for group_id, members in sorted(groups.items()):
+            movable_members = tuple(
+                block_id for block_id in sorted(members)
+                if block_id in problem.movables
+            )
+            if len(movable_members) <= 1:
+                continue
+            unit = cls._make_cluster_unit(
+                problem,
+                guidance,
+                group_id,
+                movable_members,
+                rank_by_block,
+                default_rank,
+            )
+            units.append(unit)
+            macro_members.update(movable_members)
+
+        for block_id in problem.movables:
+            if block_id in macro_members:
+                continue
+            block = problem.blocks[block_id]
+            units.append(ConstructiveUnit(
+                unit_id=f"block:{block_id}",
+                block_ids=(block_id,),
+                local_rects={
+                    block_id: (0.0, 0.0, float(block.width), float(block.height))
+                },
+                width=float(block.width),
+                height=float(block.height),
+                boundary_mask=int(block.boundary_mask),
+                guidance_rank=rank_by_block.get(block_id, default_rank + block_id),
+                predicted_center=guidance.predicted_centers.get(block_id),
+            ))
+
+        return units
+
+    @classmethod
+    def _make_cluster_unit(
+        cls,
+        problem: NormalizedProblem,
+        guidance: Guidance,
+        group_id: int,
+        members: Tuple[int, ...],
+        rank_by_block: Dict[int, int],
+        default_rank: int,
+    ) -> ConstructiveUnit:
+        x_cursor = 0.0
+        height = 0.0
+        boundary_mask = 0
+        local_rects: Dict[int, Tuple[float, float, float, float]] = {}
+        predicted_centers: List[Tuple[float, float]] = []
+
+        for block_id in members:
+            block = problem.blocks[block_id]
+            width = float(block.width)
+            block_height = float(block.height)
+            local_rects[block_id] = (x_cursor, 0.0, width, block_height)
+            x_cursor += width
+            height = max(height, block_height)
+            boundary_mask |= int(block.boundary_mask)
+            predicted = guidance.predicted_centers.get(block_id)
+            if predicted is not None:
+                predicted_centers.append(predicted)
+
+        predicted_center = None
+        if predicted_centers:
+            predicted_center = (
+                sum(center[0] for center in predicted_centers) / len(predicted_centers),
+                sum(center[1] for center in predicted_centers) / len(predicted_centers),
+            )
+
+        return ConstructiveUnit(
+            unit_id=f"cluster:{group_id}",
+            block_ids=members,
+            local_rects=local_rects,
+            width=x_cursor,
+            height=height,
+            boundary_mask=boundary_mask,
+            guidance_rank=min(rank_by_block.get(block_id, default_rank + block_id) for block_id in members),
+            predicted_center=predicted_center,
+        )
+
+    @classmethod
+    def _order_variants(
+        cls,
+        units: List[ConstructiveUnit],
+    ) -> List[Tuple[str, List[ConstructiveUnit]]]:
+        variants = [
+            (
+                "constructive:guidance_units",
+                sorted(units, key=lambda unit: (
+                    unit.guidance_rank,
+                    unit.min_block_id,
+                    unit.unit_id,
+                )),
+            ),
+            (
+                "constructive:grouping_macro_priority",
+                sorted(units, key=lambda unit: (
+                    0 if len(unit.block_ids) > 1 else 1,
+                    unit.guidance_rank,
+                    unit.min_block_id,
+                    unit.unit_id,
+                )),
+            ),
+            (
+                "constructive:boundary_skyline_connected",
+                sorted(units, key=lambda unit: (
+                    cls._boundary_bucket(unit.boundary_mask),
+                    -unit.area,
+                    unit.guidance_rank,
+                    unit.min_block_id,
+                    unit.unit_id,
+                )),
+            ),
+        ]
+
+        unique_variants: List[Tuple[str, List[ConstructiveUnit]]] = []
+        seen = set()
+        for name, ordered_units in variants:
+            signature = tuple(unit.unit_id for unit in ordered_units)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            unique_variants.append((name, ordered_units))
+        return unique_variants
+
+    @staticmethod
+    def _boundary_bucket(mask: int) -> int:
+        wants_left = bool(mask & 1)
+        wants_right = bool(mask & 2)
+        wants_top = bool(mask & 4)
+        wants_bottom = bool(mask & 8)
+        if (wants_left or wants_right) and (wants_top or wants_bottom):
+            return 0
+        if wants_left or wants_right or wants_top or wants_bottom:
+            return 1
+        return 2
+
+    @classmethod
+    def _legalize_order(
+        cls,
+        problem: NormalizedProblem,
+        guidance: Guidance,
+        units: List[ConstructiveUnit],
+    ) -> PlacementState:
+        state = PlacementState(
+            positions=[None] * problem.block_count,
+            occupied=[],
+            placed_order=[],
+        )
+
+        for block_id in problem.anchors:
+            block = problem.blocks[block_id]
+            if block.preplaced_x is None or block.preplaced_y is None:
+                state.failed = True
+                state.warnings.append(f"anchor_{block_id}_missing_coordinates")
+                continue
+            rect = (
+                float(block.preplaced_x),
+                float(block.preplaced_y),
+                float(block.width),
+                float(block.height),
+            )
+            if not AnchorAwareLegalizer._rect_is_valid(rect):
+                state.failed = True
+                state.warnings.append(f"anchor_{block_id}_invalid_rectangle")
+                continue
+            if AnchorAwareLegalizer._overlaps_occupied(rect, state.occupied):
+                state.failed = True
+                state.warnings.append(f"anchor_{block_id}_overlaps_existing_anchor")
+            state.positions[block_id] = rect
+            state.occupied.append((block_id, rect))
+            state.placed_order.append(block_id)
+
+        for unit in units:
+            if all(state.positions[block_id] is not None for block_id in unit.block_ids):
+                continue
+            origin = cls._choose_unit_origin(problem, unit, state, guidance)
+            if origin is None:
+                state.failed = True
+                state.warnings.append(f"unit_{unit.unit_id}_no_legal_candidate")
+                continue
+            expanded = cls._expand_unit(unit, origin)
+            for block_id in sorted(expanded):
+                rect = expanded[block_id]
+                state.positions[block_id] = rect
+                state.occupied.append((block_id, rect))
+                state.placed_order.append(block_id)
+
+        if not state.is_complete:
+            state.failed = True
+            state.warnings.append("constructive_placement_incomplete")
+        return state
+
+    @classmethod
+    def _choose_unit_origin(
+        cls,
+        problem: NormalizedProblem,
+        unit: ConstructiveUnit,
+        state: PlacementState,
+        guidance: Guidance,
+    ) -> Optional[Tuple[float, float]]:
+        best_key: Optional[Tuple[float, float, float, float, float, float, str]] = None
+        best_origin: Optional[Tuple[float, float]] = None
+
+        for origin in cls._generate_unit_origins(unit, state):
+            expanded = cls._expand_unit(unit, origin)
+            if not cls._unit_rects_are_valid(expanded):
+                continue
+            if cls._unit_has_internal_overlap(expanded):
+                continue
+            if cls._unit_overlaps_occupied(expanded, state.occupied):
+                continue
+
+            score = cls._score_unit_origin(problem, unit, origin, expanded, state, guidance)
+            if best_key is None or score < best_key:
+                best_key = score
+                best_origin = origin
+        return best_origin
+
+    @classmethod
+    def _generate_unit_origins(
+        cls,
+        unit: ConstructiveUnit,
+        state: PlacementState,
+    ) -> List[Tuple[float, float]]:
+        candidates: List[Tuple[float, float]] = []
+
+        def add(x: float, y: float) -> None:
+            if math.isfinite(x) and math.isfinite(y):
+                candidates.append((float(x), float(y)))
+
+        add(0.0, 0.0)
+        if unit.predicted_center is not None:
+            add(
+                unit.predicted_center[0] - unit.width / 2.0,
+                unit.predicted_center[1] - unit.height / 2.0,
+            )
+
+        bbox = AnchorAwareLegalizer._bbox(state.occupied)
+        if bbox is None:
+            return cls._trim_candidates(cls._unique_candidates(candidates), unit)
+
+        min_x, min_y, max_x, max_y = bbox
+        add(min_x, min_y)
+        add(max_x, min_y)
+        add(min_x, max_y)
+        add(max_x, max_y)
+        add(min_x - unit.width, min_y)
+        add(min_x, min_y - unit.height)
+        add(max_x - unit.width, max_y)
+        add(max_x, max_y - unit.height)
+
+        x_edges = [min_x, max_x, min_x - unit.width, max_x - unit.width, 0.0]
+        y_edges = [min_y, max_y, min_y - unit.height, max_y - unit.height, 0.0]
+
+        for _, (x, y, width, height) in sorted(
+            state.occupied,
+            key=lambda item: (item[1][0], item[1][1], item[0]),
+        ):
+            right = x + width
+            top = y + height
+            add(right, y)
+            add(x, top)
+            add(right, top)
+            add(x - unit.width, y)
+            add(x, y - unit.height)
+            add(right, y - unit.height)
+            add(x - unit.width, top)
+            add(right, min_y)
+            add(min_x, top)
+            add(max_x, y)
+            add(x, max_y)
+            x_edges.extend([x, right, x - unit.width, right - unit.width])
+            y_edges.extend([y, top, y - unit.height, top - unit.height])
+
+        cls._add_boundary_origins(unit, x_edges, y_edges, min_x, min_y, max_x, max_y, add)
+
+        if unit.predicted_center is not None:
+            pred_x = unit.predicted_center[0] - unit.width / 2.0
+            pred_y = unit.predicted_center[1] - unit.height / 2.0
+            close_x = cls._closest_edges(x_edges, pred_x)
+            close_y = cls._closest_edges(y_edges, pred_y)
+            for x in close_x:
+                add(x, pred_y)
+            for y in close_y:
+                add(pred_x, y)
+            for x in close_x[:6]:
+                for y in close_y[:6]:
+                    add(x, y)
+
+        return cls._trim_candidates(cls._unique_candidates(candidates), unit)
+
+    @classmethod
+    def _add_boundary_origins(
+        cls,
+        unit: ConstructiveUnit,
+        x_edges: List[float],
+        y_edges: List[float],
+        min_x: float,
+        min_y: float,
+        max_x: float,
+        max_y: float,
+        add,
+    ) -> None:
+        if unit.boundary_mask == 0:
+            return
+
+        horizontal: List[float] = []
+        vertical: List[float] = []
+        if unit.boundary_mask & 1:
+            horizontal.extend([min_x - unit.width, min_x])
+        if unit.boundary_mask & 2:
+            horizontal.extend([max_x, max_x - unit.width])
+        if unit.boundary_mask & 8:
+            vertical.extend([min_y - unit.height, min_y])
+        if unit.boundary_mask & 4:
+            vertical.extend([max_y, max_y - unit.height])
+
+        if not horizontal:
+            horizontal = cls._closest_edges(x_edges, min_x)
+        if not vertical:
+            vertical = cls._closest_edges(y_edges, min_y)
+
+        for x in cls._unique_values(horizontal)[:8]:
+            for y in cls._unique_values(vertical)[:8]:
+                add(x, y)
+
+    @classmethod
+    def _trim_candidates(
+        cls,
+        candidates: List[Tuple[float, float]],
+        unit: ConstructiveUnit,
+    ) -> List[Tuple[float, float]]:
+        if len(candidates) <= cls.MAX_CANDIDATES_PER_UNIT:
+            return candidates
+        if unit.predicted_center is None:
+            return candidates[:cls.MAX_CANDIDATES_PER_UNIT]
+
+        target_x = unit.predicted_center[0] - unit.width / 2.0
+        target_y = unit.predicted_center[1] - unit.height / 2.0
+        candidates.sort(key=lambda origin: (
+            abs(origin[0] - target_x) + abs(origin[1] - target_y),
+            abs(origin[0]) + abs(origin[1]),
+            origin[1],
+            origin[0],
+        ))
+        return candidates[:cls.MAX_CANDIDATES_PER_UNIT]
+
+    @classmethod
+    def _score_unit_origin(
+        cls,
+        problem: NormalizedProblem,
+        unit: ConstructiveUnit,
+        origin: Tuple[float, float],
+        expanded: Dict[int, Tuple[float, float, float, float]],
+        state: PlacementState,
+        guidance: Guidance,
+    ) -> Tuple[float, float, float, float, float, float, str]:
+        current_bbox = AnchorAwareLegalizer._bbox(state.occupied)
+        expanded_bbox = current_bbox
+        for rect in expanded.values():
+            expanded_bbox = AnchorAwareLegalizer._expanded_bbox(expanded_bbox, rect)
+
+        current_area = AnchorAwareLegalizer._bbox_area(current_bbox)
+        expanded_area = AnchorAwareLegalizer._bbox_area(expanded_bbox)
+        area_growth = max(0.0, expanded_area - current_area)
+
+        boundary_miss = cls._unit_boundary_miss(unit, expanded, expanded_bbox)
+        predicted_distance = cls._predicted_distance(unit, expanded, guidance)
+        connection_cost = 0.0
+        coordinate_bias = abs(origin[0]) + abs(origin[1])
+        span = 0.0
+        if expanded_bbox is not None:
+            span = (expanded_bbox[2] - expanded_bbox[0]) + (expanded_bbox[3] - expanded_bbox[1])
+
+        return (
+            round(boundary_miss, cls.ROUND_DIGITS),
+            round(area_growth, cls.ROUND_DIGITS),
+            round(connection_cost, cls.ROUND_DIGITS),
+            round(predicted_distance, cls.ROUND_DIGITS),
+            round(span + coordinate_bias, cls.ROUND_DIGITS),
+            round(origin[1], cls.ROUND_DIGITS),
+            unit.unit_id,
+        )
+
+    @staticmethod
+    def _unit_boundary_miss(
+        unit: ConstructiveUnit,
+        expanded: Dict[int, Tuple[float, float, float, float]],
+        bbox: Optional[Tuple[float, float, float, float]],
+    ) -> float:
+        if unit.boundary_mask == 0 or bbox is None:
+            return 0.0
+        min_x, min_y, max_x, max_y = bbox
+        misses = 0
+        for rect in expanded.values():
+            x, y, width, height = rect
+            touches = {
+                1: abs(x - min_x) <= SoftConstraintImprover.BOUNDARY_EPS,
+                2: abs(x + width - max_x) <= SoftConstraintImprover.BOUNDARY_EPS,
+                4: abs(y + height - max_y) <= SoftConstraintImprover.BOUNDARY_EPS,
+                8: abs(y - min_y) <= SoftConstraintImprover.BOUNDARY_EPS,
+            }
+            if all(touches[bit] for bit in (1, 2, 4, 8) if unit.boundary_mask & bit):
+                return 0.0
+        for bit in (1, 2, 4, 8):
+            if unit.boundary_mask & bit:
+                misses += 1
+        return float(misses)
+
+    @staticmethod
+    def _predicted_distance(
+        unit: ConstructiveUnit,
+        expanded: Dict[int, Tuple[float, float, float, float]],
+        guidance: Guidance,
+    ) -> float:
+        distances: List[float] = []
+        for block_id, rect in expanded.items():
+            predicted = guidance.predicted_centers.get(block_id)
+            if predicted is None:
+                continue
+            center = (rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0)
+            distances.append(math.hypot(center[0] - predicted[0], center[1] - predicted[1]))
+        if not distances:
+            return 0.0
+        return sum(distances) / len(distances)
+
+    @classmethod
+    def _expand_unit(
+        cls,
+        unit: ConstructiveUnit,
+        origin: Tuple[float, float],
+    ) -> Dict[int, Tuple[float, float, float, float]]:
+        origin_x, origin_y = origin
+        return {
+            block_id: (
+                origin_x + rect[0],
+                origin_y + rect[1],
+                rect[2],
+                rect[3],
+            )
+            for block_id, rect in unit.local_rects.items()
+        }
+
+    @staticmethod
+    def _unit_rects_are_valid(
+        rects: Dict[int, Tuple[float, float, float, float]],
+    ) -> bool:
+        return all(AnchorAwareLegalizer._rect_is_valid(rect) for rect in rects.values())
+
+    @classmethod
+    def _unit_has_internal_overlap(
+        cls,
+        rects: Dict[int, Tuple[float, float, float, float]],
+    ) -> bool:
+        items = list(rects.items())
+        for i, (_, first) in enumerate(items):
+            for _, second in items[i + 1:]:
+                if AnchorAwareLegalizer._rectangles_overlap(first, second):
+                    return True
+        return False
+
+    @staticmethod
+    def _unit_overlaps_occupied(
+        rects: Dict[int, Tuple[float, float, float, float]],
+        occupied: List[Tuple[int, Tuple[float, float, float, float]]],
+    ) -> bool:
+        for rect in rects.values():
+            if AnchorAwareLegalizer._overlaps_occupied(rect, occupied):
+                return True
+        return False
+
+    @classmethod
+    def _closest_edges(cls, values: List[float], target: float) -> List[float]:
+        unique_values = cls._unique_values(values)
+        unique_values.sort(key=lambda value: (abs(value - target), value))
+        return unique_values[:AnchorAwareLegalizer.CLOSE_EDGE_LIMIT]
+
+    @classmethod
+    def _unique_candidates(
+        cls,
+        candidates: List[Tuple[float, float]],
+    ) -> List[Tuple[float, float]]:
+        seen = set()
+        unique: List[Tuple[float, float]] = []
+        for x, y in candidates:
+            key = (round(x, cls.ROUND_DIGITS), round(y, cls.ROUND_DIGITS))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append((x, y))
+        return unique
+
+    @classmethod
+    def _unique_values(cls, values: List[float]) -> List[float]:
+        seen = set()
+        unique: List[float] = []
+        for value in values:
+            if not math.isfinite(value):
+                continue
+            key = round(float(value), cls.ROUND_DIGITS)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(float(value))
+        return unique
+
+    @classmethod
+    def _positions_signature(
+        cls,
+        positions: List[Tuple[float, float, float, float]],
+    ) -> Tuple[Tuple[float, float, float, float], ...]:
+        return tuple(
+            (
+                round(rect[0], cls.ROUND_DIGITS),
+                round(rect[1], cls.ROUND_DIGITS),
+                round(rect[2], cls.ROUND_DIGITS),
+                round(rect[3], cls.ROUND_DIGITS),
+            )
+            for rect in positions
+        )
+
+
+class CandidateSelector:
+    @classmethod
+    def best_feasible(
+        cls,
+        problem: NormalizedProblem,
+        candidates: List[Tuple[str, int, List[Tuple[float, float, float, float]]]],
+        checker: FeasibilityChecker,
+    ) -> Optional[CandidateChoice]:
+        best: Optional[CandidateChoice] = None
+        for source, source_order, positions in candidates:
+            try:
+                improved = SoftConstraintImprover.improve(problem, positions, checker)
+                report = checker.check(improved, problem)
+            except (IndexError, RuntimeError, TypeError, ValueError):
+                continue
+            if not report.is_feasible:
+                continue
+            try:
+                key = cls._proxy_key(problem, improved, source_order)
+            except (OverflowError, RuntimeError, TypeError, ValueError):
+                continue
+            choice = CandidateChoice(
+                source=source,
+                source_order=source_order,
+                positions=improved,
+                report=report,
+                key=key,
+            )
+            if best is None or choice.key < best.key:
+                best = choice
+        return best
+
+    @classmethod
+    def _proxy_key(
+        cls,
+        problem: NormalizedProblem,
+        positions: List[Tuple[float, float, float, float]],
+        source_order: int,
+    ) -> Tuple[float, float, float, float, float, int]:
+        soft_violations = SoftConstraintImprover._soft_violations(problem, positions)
+        soft_relative = soft_violations / SoftConstraintImprover._soft_denominator(problem)
+        hpwl = cls._finite_float(SoftConstraintImprover._hpwl(problem, positions))
+        bbox_area = cls._finite_float(calculate_bbox_area(positions))
+        quality = hpwl + ConstructiveCandidateLegalizer.PROXY_BBOX_WEIGHT * bbox_area
+        proxy = (
+            1.0
+            + quality
+            + ConstructiveCandidateLegalizer.PROXY_SOFT_WEIGHT * soft_relative
+        ) * math.exp(min(50.0, 2.0 * soft_relative))
+        if not math.isfinite(proxy):
+            proxy = float("inf")
+        return (
+            round(proxy, ConstructiveCandidateLegalizer.ROUND_DIGITS),
+            round(soft_relative, ConstructiveCandidateLegalizer.ROUND_DIGITS),
+            float(soft_violations),
+            round(hpwl, ConstructiveCandidateLegalizer.ROUND_DIGITS),
+            round(bbox_area, ConstructiveCandidateLegalizer.ROUND_DIGITS),
+            source_order,
+        )
+
+    @staticmethod
+    def _finite_float(value: object, default: float = 0.0) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return default
+        return result if math.isfinite(result) else default
+
+
 # =============================================================================
 # 1. NETLIST EDGE-GNN (電路圖拓樸特徵提取器) - 完全與訓練端對齊
 # =============================================================================
@@ -1926,11 +2599,33 @@ class MyOptimizer(FloorplanOptimizer):
             print(f"--> Anchor-aware legalizer warnings: {placement_state.warnings}")
 
         checker = FeasibilityChecker()
-        legalized_positions = placement_state.as_positions(problem)
-        improved_positions = SoftConstraintImprover.improve(problem, legalized_positions, checker)
-        optimized_report = checker.check(improved_positions, problem)
-        if not placement_state.failed and optimized_report.is_feasible:
-            return improved_positions
+        candidate_positions: List[Tuple[str, int, List[Tuple[float, float, float, float]]]] = []
+        if not placement_state.failed:
+            candidate_positions.append((
+                "ml_anchor_aware",
+                0,
+                placement_state.as_positions(problem),
+            ))
+
+        try:
+            constructive_candidates = ConstructiveCandidateLegalizer.build_candidates(problem, guidance)
+        except (IndexError, RuntimeError, TypeError, ValueError) as exc:
+            constructive_candidates = []
+            if self.verbose:
+                print(f"--> Constructive candidate path skipped: {type(exc).__name__}")
+
+        for candidate_index, (source, positions) in enumerate(constructive_candidates, start=1):
+            candidate_positions.append((source, candidate_index, positions))
+
+        best_candidate = CandidateSelector.best_feasible(
+            problem,
+            candidate_positions,
+            checker,
+        )
+        if best_candidate is not None:
+            return best_candidate.positions
+
+        optimized_report = checker.check(placement_state.as_positions(problem), problem)
 
         if self.verbose:
             print(

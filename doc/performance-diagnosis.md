@@ -2,17 +2,32 @@
 
 ## Purpose
 
-Diagnose why the trained `iccad2026contest/my_optimizer.py` run remains near the infeasible score cap even though the saved full validation run reports 100/100 feasible cases.
+Diagnose the next optimization step for `iccad2026contest/my_optimizer.py`, with the user goal of keeping the GNN + diffusion model for coarse coordinate guidance while integrating the stronger legalization strategy from `noML_optimizer.py`.
+
+The key question is no longer whether `my_optimizer.py` can be made hard-feasible. Saved results show hard feasibility is stable. The diagnosis focuses on why score remains near the feasible cap and which `noML_optimizer.py` legalization idea should be integrated first.
+
+No optimizer implementation code was changed during this diagnosis.
 
 ## Diagnosis Scope
 
-This diagnosis covers the saved validation result `iccad2026contest/eval_full_after_training.json`, the local evaluator scoring formula, and the optimizer implementation paths that affect feasibility, HPWL, bounding-box area, and soft-constraint violations.
+Covered:
 
-No optimizer code was changed during this diagnosis.
+- `iccad2026contest/my_optimizer.py` normalization, guidance, anchor-aware legalizer, fallback packer, soft improver, and `solve()` orchestration.
+- `noML_optimizer.py` parsing, dimension planning, placement-unit abstraction, constructive candidates, candidate scoring, boundary-frame/skyline legalization, and local-search flow.
+- `iccad2026contest/iccad2026_evaluate.py` hard feasibility checks and cost formula.
+- Saved validation artifacts in `iccad2026contest/eval_full_after_training.json`, `iccad2026contest/my_optimizer_results.json`, `/tmp/senpai_pre_boundary.json`, and `/tmp/senpai_post_boundary.json`.
+
+Not covered:
+
+- No evaluator rerun was performed.
+- No training or checkpoint generation was performed.
+- No hidden-test behavior or official runtime normalization was measured.
+- No full `noML_optimizer.py` benchmark artifact exists in this workspace.
 
 ## Source Documents Read
 
 - `AGENTS.md`
+- `README.md`
 - `doc/problem-brief.md`
 - `doc/proposal.md`
 - `doc/high-level-design.md`
@@ -20,145 +35,175 @@ No optimizer code was changed during this diagnosis.
 - `doc/test-plan.md`
 - `doc/quality-gates.md`
 - `doc/tasks/progress.md`
-- `iccad2026contest/eval_full_after_training.json`
+- `doc/performance-log.md`
 - `iccad2026contest/iccad2026_evaluate.py`
 - `iccad2026contest/my_optimizer.py`
+- `noML_optimizer.py`
+- `iccad2026contest/training_example.py`
+- `iccad2026contest/eval_full_after_training.json`
+- `iccad2026contest/eval_case0_after_training.json`
+- `iccad2026contest/my_optimizer_results.json`
+- `/tmp/senpai_pre_boundary.json`
+- `/tmp/senpai_post_boundary.json`
+- `/tmp/senpai_post_boundary_case0.json`
 
 ## Current Correctness Status
 
-The user-provided lab-server run reports 100/100 feasible validation cases:
+Saved evaluator results report hard feasibility as stable:
 
-```text
-python iccad2026_evaluate.py --evaluate my_optimizer.py --output eval_full_after_training.json
-Feasible: 100
-Total Score: 9.7460
-Avg Cost: 9.6864
-Avg Runtime: 1.13s
-```
+- `iccad2026contest/eval_full_after_training.json`: 100/100 feasible, total score `9.7460`, average runtime `1.13s`.
+- `/tmp/senpai_post_boundary.json`: 100/100 feasible, total score `9.7367`, average runtime `0.68s`.
+- `iccad2026contest/my_optimizer_results.json`: 100/100 feasible, total score `9.9565`, average runtime `0.45s`.
 
-The saved JSON in this workspace matches that baseline. Hard feasibility is therefore stable enough to proceed with score optimization. Local evaluator reruns were not performed because this repository requires approval before evaluator commands. A read-only attempt to compute boundary/grouping/MIB subcounts from the local evaluator was blocked by a missing local dependency: `ModuleNotFoundError: No module named 'numpy'`.
+The current workspace has no `iccad2026contest/checkpoints/` directory, so a fresh local run would use deterministic no-checkpoint guidance unless checkpoints are restored. Evaluator commands were not run because repository rules require approval and evaluation writes output JSON by default.
+
+Correctness is stable enough to proceed with optimization, provided the next implementation keeps the existing `FeasibilityChecker` acceptance gate and fallback path.
 
 ## Current Performance Baseline
 
 | Metric | Value | Command | Verified? |
 |---|---:|---|---|
-| Score | 9.7459558487 | `python iccad2026_evaluate.py --evaluate my_optimizer.py --output eval_full_after_training.json` | User-provided run; saved JSON parsed locally |
-| Runtime | 1.1306540513 s average | Same command | User-provided run; saved JSON parsed locally |
+| Score | 9.7367167134 | `python iccad2026_evaluate.py --evaluate my_optimizer.py --output /tmp/senpai_post_boundary.json` | Stale saved artifact parsed in this session; command not rerun |
+| Runtime | 0.6807339573 s average | Same command | Stale saved artifact parsed in this session; command not rerun |
 | Memory | Unknown | Not measured | Missing |
 
-Additional parsed baseline facts:
+Additional baselines:
 
-- Feasible cases: 100/100.
-- Average cost: 9.6864105735.
-- Cost-capped cases: 72/100 at `9.999999`.
-- Weighted share of cost-capped cases: 80.01% of final score weight.
-- Weighted average `hpwl_gap`: 3.0854.
-- Weighted average `area_gap`: 0.2623.
-- Weighted average `violations_relative`: 0.8135.
-- Weighted average runtime: 2.6663 s, but local scoring resets runtime factor to 1.0 for cost computation.
+- Best saved trained-checkpoint run in the repo: score `9.7459558487`, 100/100 feasible, average runtime `1.1306540513s`, 72/100 cases capped at `9.999999`.
+- Saved no-checkpoint pre-boundary run: score `9.9564528621`, 100/100 feasible, average runtime about `0.47s`, 79/100 cases capped.
+- Saved no-checkpoint post-boundary run: score `9.7367167134`, 100/100 feasible, average runtime about `0.68s`, 64/100 cases capped.
+
+For `/tmp/senpai_post_boundary.json`, weighted metrics are:
+
+- weighted `hpwl_gap`: `3.1245`;
+- weighted `area_gap`: `0.2027`;
+- weighted `violations_relative`: `0.7853`;
+- capped-case weighted share: `65.70%`.
 
 ## Expected Performance Target
 
-No official numeric target is available in the local documents. The practical near-term target should be:
+No official numeric target is available in the local docs. The practical near-term target is:
 
-- keep feasibility at 100/100;
-- reduce total score below the current 9.7460 baseline;
-- reduce the number of capped feasible cases;
-- prioritize larger cases because block counts 101-120 contribute about 81.13% of final score weight in this saved run.
+- preserve 100/100 local validation feasibility;
+- reduce score below the current best saved `9.7367`;
+- reduce capped-case count and capped weighted share;
+- reduce weighted `violations_relative`, especially boundary and grouping violations;
+- avoid a large runtime increase on 101-120 block cases because those dominate the exponential total score.
 
 ## Gap Analysis
 
-The bottleneck is not hard feasibility anymore. The bottleneck is quality under the feasible scoring formula.
+The score is still near the feasible cap because soft violations and HPWL remain high. Area is not the first-order bottleneck.
 
-Counterfactual term analysis from the saved JSON:
+Counterfactuals from the saved post-boundary run:
 
 | Counterfactual | Weighted Total Score |
 |---|---:|
-| Original saved run | 9.7460 |
-| Set `violations_relative = 0` only | 2.6738 |
-| Set `hpwl_gap = 0` only | 5.7889 |
-| Set `area_gap = 0` only | 9.5855 |
-| Set `hpwl_gap = 0` and `area_gap = 0` | 5.1208 |
+| Original post-boundary run | 9.7367 |
+| Set `violations_relative = 0` only | 2.6636 |
+| Set `hpwl_gap = 0` only | 5.3235 |
+| Set `area_gap = 0` only | 9.5597 |
+| Halve `violations_relative` | 5.7995 |
+| Halve `hpwl_gap` | 8.6049 |
 
-This makes the ranking clear:
+Read-only reconstruction of soft subcomponents was computed from saved positions plus `LiteTensorDataTest/` constraints using `noML_optimizer.py`'s `_soft_violations(...)` helper. This was not an evaluator rerun, but it closely matches the saved aggregate `violations_relative`.
 
-1. Soft-constraint violations are the largest scoring bottleneck because they are inside `exp(2 * V_rel)`.
-2. HPWL is the second major bottleneck.
-3. Bounding-box area is currently a much smaller first-order lever.
-4. Runtime is not affecting the saved local score because the evaluator applies neutral local runtime factor `1.0`.
+For `/tmp/senpai_post_boundary.json`, weighted soft counts are approximately:
+
+| Component | Weighted Count | Share of Weighted Soft Violations |
+|---|---:|---:|
+| Boundary | 24.56 | 53.17% |
+| Grouping | 21.09 | 45.66% |
+| MIB | 0.54 | 1.16% |
+
+Component counterfactuals for the post-boundary run:
+
+| Counterfactual | Weighted Total Score |
+|---|---:|
+| Remove boundary violations only | 5.5932 |
+| Remove grouping violations only | 6.1813 |
+| Remove MIB violations only | 9.6887 |
+| Remove boundary and grouping violations | 2.7160 |
+
+This makes the next target clear: the legalizer must address boundary and grouping together. MIB-only work is not a good first optimization because it explains about 1% of weighted soft violations.
 
 ## Benchmark or Evaluator Details
 
 `iccad2026contest/iccad2026_evaluate.py` computes feasible cost as:
 
 ```text
-Cost = (1 + 0.5 * (max(0, HPWL_gap) + max(0, Area_gap))) * exp(2 * V_rel) * runtime_adjustment
+Cost = (1 + 0.5 * (max(0, HPWL_gap) + max(0, Area_gap))) * exp(2 * V_rel) * RuntimeFactor
 ```
 
-For local full evaluation, runtime is recomputed with neutral runtime factor `1.0`. Feasible costs are capped at `9.999999`, which explains why many cases look indistinguishable from infeasible cases even though they are feasible.
+The local evaluator sets `RuntimeFactor = 1.0`, then caps feasible costs at `9.999999`. Hidden leaderboard runtime normalization may differ.
 
-The total score is an exponentially weighted average using `exp(block_count / 12)`, so large block-count cases dominate. In the saved run:
-
-- 101-110 contributes 24.58% weight, score 9.8636.
-- 111-115 contributes 22.47% weight, score 9.999999.
-- 116-120 contributes 34.08% weight, score 9.6769.
+Hard infeasibility still costs `10.0`, so any integration from `noML_optimizer.py` must be gated by `FeasibilityChecker` and fallback routing. The local total score is exponentially weighted by `exp(block_count / 12)`, so larger cases matter most.
 
 ## Observed Bottlenecks
 
-- Soft violation rate is very high: weighted `violations_relative = 0.8135`; many printed cases are around `0.6-0.9`.
-- HPWL is also high: weighted `hpwl_gap = 3.0854`; case 0 has `hpwl_gap = 3.9396`.
-- The first saved case shows a nearly one-column placement: most blocks have `x = 71.0`, which is consistent with poor HPWL and a legalizer dominated by packing legality rather than netlist quality.
-- Area is not the first bottleneck: weighted `area_gap = 0.2623`, and zeroing area alone barely changes final score.
-- The score cap hides partial progress: 72 cases are already capped, and capped cases carry about 80.01% of the final weighted score.
+- Soft violations remain high after boundary-only improvement: weighted `violations_relative` is about `0.7853`.
+- Boundary violations are still the largest reconstructed soft component, but grouping is nearly as large.
+- HPWL remains high: weighted `hpwl_gap` is about `3.1245` in the post-boundary run.
+- Current `AnchorAwareLegalizer._score_candidate(...)` scores area growth, distance to diffusion prediction, span, coordinate bias, and tie-break coordinates, but does not use connectivity, pins, grouping, MIB, or boundary metadata.
+- Current `SoftConstraintImprover` can move individual boundary blocks, but it cannot build boundary-frame layouts or group macros.
+- Current `HardConstraintNormalizer` uses square soft dimensions and does not synchronize MIB-compatible shapes, while `noML_optimizer.py` has `_plan_dimensions(...)` with MIB-compatible shape planning.
+- Current `DiffusionGuidanceAdapter` uses model output only to sort blocks and seed candidate positions. With no local checkpoint directory, it falls back to block-index order.
+- `noML_optimizer.py` has a richer legal candidate architecture: `PlacementUnit`, cluster macros, boundary-frame/skyline packers, connected bottom-left placement, candidate preflight, proxy scoring, and bounded local search.
 
 ## Likely Causes
 
-### Cause 1: SoftConstraintImprover is a no-op
+### Cause 1: Current legalizer places individual blocks instead of soft-constraint-aware units
 
 - Type: Algorithmic limitation.
-- Evidence: `iccad2026contest/my_optimizer.py` defines `SoftConstraintImprover.improve(...)` to return a copy of the placement unchanged. Boundary, grouping, and MIB moves are explicitly disabled. The evaluator's `violations_relative` term is the largest counterfactual lever.
-- Affected modules: `SoftConstraintImprover`, `FeasibilityChecker`, `MyOptimizer.solve`.
-- Risk: Low for checker-backed boundary moves; medium for grouping and MIB moves because they can disturb legality or area constraints.
+- Evidence: `iccad2026contest/my_optimizer.py` places each movable block independently in `AnchorAwareLegalizer.legalize(...)`. `noML_optimizer.py` groups movable cluster members into `PlacementUnit` cluster macros via `_plan_soft_units(...)` and `_make_cluster_macro(...)`, making grouping abutment legal by construction for those units. Reconstructed post-boundary soft violations are about 45.66% grouping.
+- Affected modules: `HardConstraintNormalizer`, `AnchorAwareLegalizer`, `SoftConstraintImprover`, new adapter code inside `iccad2026contest/my_optimizer.py`.
+- Risk: Medium. Cluster macros can increase area or HPWL if used blindly, so they should be an alternative candidate, not a replacement path.
 - Confidence: High.
 
-### Cause 2: AnchorAwareLegalizer scoring ignores HPWL and soft constraints
+### Cause 2: Candidate scoring is not aligned with evaluator quality terms
 
-- Type: Algorithmic limitation / heuristic mismatch.
-- Evidence: `AnchorAwareLegalizer._score_candidate(...)` ranks by area growth, predicted distance, span, coordinate bias, and coordinates. It does not use `b2b_connectivity`, `p2b_connectivity`, pins, boundary masks, grouping, or MIB metadata. Saved case 0 has a vertical-column layout and `hpwl_gap = 3.9396`.
-- Affected modules: `AnchorAwareLegalizer`, `DiffusionGuidanceAdapter`, `MyOptimizer.solve`.
-- Risk: Medium. HPWL-aware scoring can improve wirelength but may increase runtime or area if not bounded.
+- Type: Heuristic mismatch.
+- Evidence: `AnchorAwareLegalizer._score_candidate(...)` ignores `b2b_connectivity`, `p2b_connectivity`, `pins_pos`, and aggregate soft violations. `noML_optimizer.py` scores candidates with HPWL, bounding-box area, soft relative violations, and a hard-feasibility barrier in `_score_candidate(...)`, with `CandidateManager` selecting the best feasible candidate.
+- Affected modules: `AnchorAwareLegalizer`, `SoftConstraintImprover`, `FeasibilityChecker`, possible candidate manager inside `my_optimizer.py`.
+- Risk: Medium. More complete scoring can improve quality but may increase runtime if every candidate performs full HPWL and soft checks.
 - Confidence: High.
 
-### Cause 3: Soft-constraint subcomponents are not measured in the saved result JSON
+### Cause 3: Diffusion guidance is too weakly coupled to legalization quality
 
-- Type: Unknown / needs measurement, with likely algorithmic limitation.
-- Evidence: `TestResult` stores only aggregate `violations_relative`, not boundary, grouping, MIB, numerator, or denominator. The local attempt to re-evaluate component counts was blocked by missing `numpy`. The implementation currently derives most movable soft dimensions independently as square blocks and does not abut groups or enforce boundary contact.
-- Affected modules: `iccad2026_evaluate.py` reporting path, `SoftConstraintImprover`, `HardConstraintNormalizer`, `AnchorAwareLegalizer`.
-- Risk: Medium. Optimizing the wrong soft subcomponent could produce little score movement.
+- Type: Algorithmic limitation / environment issue.
+- Evidence: `DiffusionGuidanceAdapter` currently turns model predictions into a placement order and predicted x/y preferences only. The local workspace has no checkpoint directory, so fresh runs degrade to deterministic fallback guidance. The saved trained run still has weighted `hpwl_gap` about `3.0854` and weighted `violations_relative` about `0.8135`, so model output alone is not enough without a stronger legalizer.
+- Affected modules: `DiffusionGuidanceAdapter`, `AnchorAwareLegalizer`, `MyOptimizer.solve`.
+- Risk: Low to medium. The model can remain advisory while legal candidates are generated by deterministic code.
 - Confidence: Medium.
 
 ## Optimization Hypotheses
 
 | Priority | Hypothesis | Expected Impact | Risk | Affected Files | Verification |
 |---:|---|---|---|---|---|
-| 1 | Implement checker-backed boundary-only soft-constraint improvement for movable blocks. Try translations to required current bbox edges and accept only if hard-feasible and not worse by evaluator-style proxy. | Medium to high if boundary violations are a material part of `V_rel`; directly targets the biggest score term. | Low to medium. Boundary is per-block and can be skipped when unsafe. | `iccad2026contest/my_optimizer.py` | `python iccad2026_evaluate.py --validate my_optimizer.py`; `python iccad2026_evaluate.py --evaluate my_optimizer.py --test-id 0`; full evaluation |
-| 2 | Add bounded HPWL-aware candidate scoring to `AnchorAwareLegalizer`, using already placed connected blocks and pins as an incremental term after hard-feasible filtering. | High if the one-column/strip behavior is causing most HPWL gap. | Medium. More scoring work per candidate and possible area tradeoff. | `iccad2026contest/my_optimizer.py` | Same evaluator commands; compare weighted `hpwl_gap`, score, runtime |
-| 3 | Add grouping/MIB-aware local improvement: abut blocks in the same cluster when legal, and synchronize MIB shapes only when area-compatible. | Potentially high if soft violations are dominated by grouping or MIB. | Medium to high. More complex and can easily break area, fixed-shape, or non-overlap constraints. | `iccad2026contest/my_optimizer.py` | Same evaluator commands plus per-component soft diagnostics if dependencies are available |
+| 1 | Add a noML-style constructive legalizer candidate inside `my_optimizer.py`: build placement units with movable cluster macros, preserve preplaced/fixed anchors, use diffusion order as one seed, generate a boundary-skyline-connected candidate, and choose the best hard-feasible result against the current ML-guided candidate using evaluator-style proxy scoring. | High. Targets boundary and grouping together while preserving hard feasibility; can also reduce HPWL through connected bottom-left placement. | Medium. Several helpers must be ported/adapted carefully, and runtime must stay bounded. | `iccad2026contest/my_optimizer.py` | Validate import/API, single-case evaluation, full evaluation; compare score, capped cases, weighted soft proxy, HPWL, runtime |
+| 2 | Add incremental HPWL-aware scoring directly to `AnchorAwareLegalizer._score_candidate(...)`, using already placed connected blocks and pin edges after hard-feasible filtering. | Medium to high for HPWL; less direct for soft violations. | Medium. Candidate scoring becomes more expensive and may trade off against area/soft constraints. | `iccad2026contest/my_optimizer.py` | Same evaluator commands; compare weighted `hpwl_gap`, score, and runtime |
+| 3 | Port MIB-compatible dimension planning from `noML_optimizer.py` into `HardConstraintNormalizer`, synchronizing soft MIB groups only when all members can share an area-valid shape. | Low to medium. MIB is only about 1% of reconstructed weighted soft violations, but this supports later unit-based packing. | Low to medium. Must not alter fixed/preplaced dimensions or violate soft-block area tolerance. | `iccad2026contest/my_optimizer.py` | Synthetic MIB cases plus evaluator; compare MIB violations and feasibility |
 
 ## Recommended First Optimization
 
-Implement only Hypothesis 1 first: a checker-backed, boundary-only `SoftConstraintImprover`.
+Implement only Hypothesis 1 first: a noML-style constructive legalizer candidate as an alternative candidate path inside `iccad2026contest/my_optimizer.py`.
 
-Reasoning:
+The first implementation should be deliberately bounded:
 
-- The biggest measured bottleneck is `violations_relative`.
-- The current soft-improvement stage is completely disabled.
-- Boundary moves are the smallest soft-constraint improvement that can be made reversible and legality-preserving.
-- The change can be accepted only when the full hard-feasibility checker passes, preserving the current 100/100 feasibility baseline.
+- Do not import `noML_optimizer.py` at runtime for contest submission; port or adapt only the needed helper logic into `my_optimizer.py`.
+- Keep the existing ML-guided `AnchorAwareLegalizer` output.
+- Build one additional candidate that borrows `noML_optimizer.py` concepts:
+  - placement units;
+  - cluster macros for movable grouping members;
+  - exact immutable anchors;
+  - optional MIB-compatible dimensions only when area-valid;
+  - boundary-skyline-connected constructive packing;
+  - evaluator-style hard preflight and proxy scoring.
+- Run the existing `SoftConstraintImprover` and `FeasibilityChecker` on both the current ML candidate and the noML-style candidate.
+- Return the best hard-feasible candidate by proxy score, falling back to `FeasibleFallbackPacker` when neither candidate passes.
 
 Rollback condition:
 
-- Revert the change if full evaluation feasibility drops below 100/100, total score is not lower than 9.7460, capped weighted share does not improve, or average runtime increases substantially without a score gain.
+- Revert the change if full evaluation feasibility drops below 100/100, total score does not improve below `9.7367`, capped weighted share does not improve, or average runtime grows substantially without score gain.
 
 ## Exact Prompt for Implementation Loop
 
@@ -189,22 +234,24 @@ Rules:
 
 ## Stop Conditions
 
-- Stop if validation feasibility drops below 100/100.
-- Stop if boundary-only moves do not reduce total score or capped-case count.
-- Stop if evaluator dependencies are unavailable on the target lab server.
-- Stop before training or checkpoint generation unless explicitly approved.
-- Stop before broader HPWL, grouping, or MIB changes until the boundary-only attempt is measured.
+- Stop if a local or approved evaluator run reports any hard infeasible case.
+- Stop if the noML-style candidate path replaces ML guidance instead of adding a candidate alternative.
+- Stop if runtime increases sharply on 101-120 block cases before score improves.
+- Stop if adapting the helper code requires broad rewrites outside `iccad2026contest/my_optimizer.py`.
+- Stop before installing dependencies, running training, generating checkpoints, or downloading data without approval.
 
 ## Risks and Warnings
 
-- Because 72/100 cases are capped, small improvements may not move the final score unless they are large enough to uncap weighted large cases.
-- The saved result JSON does not expose soft subcomponents, so boundary-only optimization may underperform if grouping or MIB dominates `V_rel`.
-- Official runtime normalization is not locally measurable; a slower local optimizer may be penalized differently on the leaderboard.
-- The current local environment lacks `numpy`, blocking evaluator-based component re-scoring here. The lab server environment used for the saved run likely has the required dependencies.
+- `/tmp/senpai_post_boundary.json` is a saved artifact, not a rerun from this turn.
+- Current local runs would not use trained diffusion weights because `iccad2026contest/checkpoints/` is absent.
+- The reconstructed boundary/grouping/MIB split uses `noML_optimizer.py` helper logic and saved positions, not the official evaluator's Shapely path. The aggregate values are close enough for diagnosis, but exact counts should be confirmed in an approved evaluator/instrumented run if needed.
+- A full port of `noML_optimizer.py` would be too risky as a first step; it would bypass the GNN + diffusion vision rather than integrating with it.
+- The current docs disagree about `iccad2026contest/requirements.txt`: `AGENTS.md` says it was absent, but it is present in this workspace now. No install command was run.
 
 ## Open Questions
 
-- What are the boundary, grouping, and MIB violation counts for `eval_full_after_training.json` on the lab server?
-- Does boundary-only repair reduce enough weighted large cases below the score cap?
-- How much of the HPWL gap is caused by candidate scoring versus weak diffusion guidance?
-- Are MIB groups area-compatible, or do some groups have conflicting area targets that make exact identical dimensions impossible?
+- Should the noML-style candidate be enabled only when no checkpoint is available, or always compete against the diffusion-guided candidate?
+- Should implementation copy selected helpers into `my_optimizer.py` for submission self-containment, or is depending on `noML_optimizer.py` acceptable in the user's contest packaging?
+- What score does `noML_optimizer.py` achieve on the same validation set when run directly?
+- Will the trained checkpoint be restored before the next evaluation, and should the benchmark compare both no-checkpoint and checkpoint modes?
+- Is it acceptable to add a small synthetic test harness for placement units and cluster macros, given no unit-test framework exists?
