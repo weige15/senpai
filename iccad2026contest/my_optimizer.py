@@ -1585,12 +1585,20 @@ class ConstructiveCandidateLegalizer:
     MAX_CANDIDATES_PER_UNIT = 96
     FRAME_COMPACTION_MIN_BLOCKS = 100
     FRAME_COMPACTION_MAX_CANDIDATES = 4
+    ASPECT_RATIO_MIN_BLOCKS = 100
+    ASPECT_RATIO_MAX_COMPACTION_CANDIDATES = 2
     PROXY_SOFT_WEIGHT = 1000.0
     PROXY_BBOX_WEIGHT = 0.01
     BOUNDARY_FRAME_GAP = 1.0
     BOUNDARY_FRAME_ASPECT = 1.5
     CONNECTION_SCORE_WEIGHT = 0.35
     CONNECTION_SCORE_CAP = 4.0
+    ASPECT_RATIO_LIMITS = (0.25, 4.0)
+    BOUNDARY_ASPECT_PROFILES = (
+        ("mild", 0.68, 1.48, 1.0, 1.0),
+        ("strong", 0.48, 2.08, 1.0, 1.0),
+        ("compact", 0.58, 1.72, 0.82, 1.18),
+    )
 
     @classmethod
     def build_candidates(
@@ -1626,6 +1634,17 @@ class ConstructiveCandidateLegalizer:
                 continue
             seen.add(signature)
             candidates.append((source, positions))
+
+        for source, positions in cls._boundary_aspect_ratio_candidates(
+            problem,
+            guidance,
+            connection_index,
+        ):
+            signature = cls._positions_signature(positions)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            candidates.append((source, positions))
         return candidates
 
     @classmethod
@@ -1633,6 +1652,7 @@ class ConstructiveCandidateLegalizer:
         cls,
         problem: NormalizedProblem,
         guidance: Guidance,
+        dimensions_override: Optional[Dict[int, Tuple[float, float]]] = None,
     ) -> List[ConstructiveUnit]:
         rank_by_block = {
             block_id: rank
@@ -1661,6 +1681,7 @@ class ConstructiveCandidateLegalizer:
                 movable_members,
                 rank_by_block,
                 default_rank,
+                dimensions_override,
             )
             units.append(unit)
             macro_members.update(movable_members)
@@ -1669,14 +1690,15 @@ class ConstructiveCandidateLegalizer:
             if block_id in macro_members:
                 continue
             block = problem.blocks[block_id]
+            width, height = cls._block_dimensions(problem, block_id, dimensions_override)
             units.append(ConstructiveUnit(
                 unit_id=f"block:{block_id}",
                 block_ids=(block_id,),
                 local_rects={
-                    block_id: (0.0, 0.0, float(block.width), float(block.height))
+                    block_id: (0.0, 0.0, width, height)
                 },
-                width=float(block.width),
-                height=float(block.height),
+                width=width,
+                height=height,
                 boundary_mask=int(block.boundary_mask),
                 guidance_rank=rank_by_block.get(block_id, default_rank + block_id),
                 predicted_center=guidance.predicted_centers.get(block_id),
@@ -1693,6 +1715,7 @@ class ConstructiveCandidateLegalizer:
         members: Tuple[int, ...],
         rank_by_block: Dict[int, int],
         default_rank: int,
+        dimensions_override: Optional[Dict[int, Tuple[float, float]]] = None,
     ) -> ConstructiveUnit:
         x_cursor = 0.0
         height = 0.0
@@ -1702,8 +1725,7 @@ class ConstructiveCandidateLegalizer:
 
         for block_id in members:
             block = problem.blocks[block_id]
-            width = float(block.width)
-            block_height = float(block.height)
+            width, block_height = cls._block_dimensions(problem, block_id, dimensions_override)
             local_rects[block_id] = (x_cursor, 0.0, width, block_height)
             x_cursor += width
             height = max(height, block_height)
@@ -1729,6 +1751,27 @@ class ConstructiveCandidateLegalizer:
             guidance_rank=min(rank_by_block.get(block_id, default_rank + block_id) for block_id in members),
             predicted_center=predicted_center,
         )
+
+    @staticmethod
+    def _block_dimensions(
+        problem: NormalizedProblem,
+        block_id: int,
+        dimensions_override: Optional[Dict[int, Tuple[float, float]]] = None,
+    ) -> Tuple[float, float]:
+        if dimensions_override is not None:
+            dimensions = dimensions_override.get(block_id)
+            if dimensions is not None:
+                width, height = dimensions
+                if (
+                    math.isfinite(width)
+                    and math.isfinite(height)
+                    and width > 0.0
+                    and height > 0.0
+                ):
+                    return float(width), float(height)
+
+        block = problem.blocks[block_id]
+        return float(block.width), float(block.height)
 
     @classmethod
     def _order_variants(
@@ -1816,6 +1859,213 @@ class ConstructiveCandidateLegalizer:
             connection_index,
         ))
         return candidates
+
+    @classmethod
+    def _boundary_aspect_ratio_candidates(
+        cls,
+        problem: NormalizedProblem,
+        guidance: Guidance,
+        connection_index: ConstructiveConnectionIndex,
+    ) -> List[Tuple[str, List[Tuple[float, float, float, float]]]]:
+        if problem.block_count < cls.ASPECT_RATIO_MIN_BLOCKS:
+            return []
+        if not any(
+            block.boundary_mask and not block.is_fixed and not block.is_preplaced
+            for block in problem.blocks
+        ):
+            return []
+
+        candidates: List[Tuple[str, List[Tuple[float, float, float, float]]]] = []
+        seen = set()
+        for profile_name, horizontal_ratio, vertical_ratio, corner_ratio, interior_ratio in (
+            cls.BOUNDARY_ASPECT_PROFILES
+        ):
+            dimensions = cls._aspect_profile_dimensions(
+                problem,
+                horizontal_ratio,
+                vertical_ratio,
+                corner_ratio,
+                interior_ratio,
+            )
+            if not dimensions:
+                continue
+
+            shaped_units = cls._build_units(problem, guidance, dimensions)
+            if not shaped_units:
+                continue
+            if not any(unit.boundary_mask for unit in shaped_units):
+                continue
+
+            ordered_units = sorted(shaped_units, key=lambda unit: (
+                cls._boundary_bucket(unit.boundary_mask),
+                -unit.area,
+                unit.guidance_rank,
+                unit.min_block_id,
+                unit.unit_id,
+            ))
+
+            start_positions = cls._boundary_frame_candidate(problem, ordered_units)
+            if start_positions is not None:
+                signature = cls._positions_signature(start_positions)
+                if signature not in seen:
+                    seen.add(signature)
+                    candidates.append((
+                        f"constructive:boundary_aspect:{profile_name}:frame",
+                        start_positions,
+                    ))
+
+            compact_count = 0
+            for source, positions in cls._boundary_frame_compaction_candidates(
+                problem,
+                ordered_units,
+                start_positions,
+                connection_index,
+            ):
+                signature = cls._positions_signature(positions)
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                candidates.append((
+                    f"constructive:boundary_aspect:{profile_name}:{source}",
+                    positions,
+                ))
+                compact_count += 1
+                if compact_count >= cls.ASPECT_RATIO_MAX_COMPACTION_CANDIDATES:
+                    break
+
+        return candidates
+
+    @classmethod
+    def _aspect_profile_dimensions(
+        cls,
+        problem: NormalizedProblem,
+        horizontal_ratio: float,
+        vertical_ratio: float,
+        corner_ratio: float,
+        interior_ratio: float,
+    ) -> Dict[int, Tuple[float, float]]:
+        raw_ratios: Dict[int, float] = {}
+        mib_members: Dict[int, List[int]] = {}
+        immutable_mib_ratios: Dict[int, List[float]] = {}
+
+        for block in problem.blocks:
+            if block.mib_group is not None:
+                mib_members.setdefault(block.mib_group, []).append(block.index)
+                if block.is_fixed or block.is_preplaced:
+                    fixed_ratio = cls._safe_ratio(block.width, block.height)
+                    if fixed_ratio is not None:
+                        immutable_mib_ratios.setdefault(block.mib_group, []).append(fixed_ratio)
+
+            if block.is_fixed or block.is_preplaced:
+                continue
+
+            ratio = cls._boundary_profile_ratio(
+                block.boundary_mask,
+                horizontal_ratio,
+                vertical_ratio,
+                corner_ratio,
+                interior_ratio,
+            )
+            raw_ratios[block.index] = ratio
+
+        for group_id, members in mib_members.items():
+            mutable_members = [block_id for block_id in members if block_id in raw_ratios]
+            if not mutable_members:
+                continue
+
+            immutable_ratios = immutable_mib_ratios.get(group_id)
+            if immutable_ratios:
+                shared_ratio = cls._geometric_mean_ratio(immutable_ratios)
+            else:
+                shared_ratio = cls._geometric_mean_ratio(
+                    raw_ratios[block_id] for block_id in mutable_members
+                )
+            for block_id in mutable_members:
+                raw_ratios[block_id] = shared_ratio
+
+        dimensions: Dict[int, Tuple[float, float]] = {}
+        for block_id, ratio in raw_ratios.items():
+            block = problem.blocks[block_id]
+            shaped = cls._dimensions_for_area_ratio(block.area_target, ratio)
+            if shaped is None:
+                continue
+            width, height = shaped
+            if (
+                abs(width - block.width) <= 1e-9
+                and abs(height - block.height) <= 1e-9
+            ):
+                continue
+            dimensions[block_id] = (width, height)
+        return dimensions
+
+    @classmethod
+    def _boundary_profile_ratio(
+        cls,
+        boundary_mask: int,
+        horizontal_ratio: float,
+        vertical_ratio: float,
+        corner_ratio: float,
+        interior_ratio: float,
+    ) -> float:
+        wants_horizontal_rail = bool(boundary_mask & (4 | 8))
+        wants_vertical_rail = bool(boundary_mask & (1 | 2))
+        if wants_horizontal_rail and wants_vertical_rail:
+            return cls._clamp_aspect_ratio(corner_ratio)
+        if wants_horizontal_rail:
+            return cls._clamp_aspect_ratio(horizontal_ratio)
+        if wants_vertical_rail:
+            return cls._clamp_aspect_ratio(vertical_ratio)
+        return cls._clamp_aspect_ratio(interior_ratio)
+
+    @classmethod
+    def _dimensions_for_area_ratio(
+        cls,
+        area_value: float,
+        ratio: float,
+    ) -> Optional[Tuple[float, float]]:
+        area = area_value if math.isfinite(area_value) and area_value > 0.0 else None
+        if area is None:
+            return None
+        ratio = cls._clamp_aspect_ratio(ratio)
+        width = math.sqrt(area * ratio)
+        height = math.sqrt(area / ratio)
+        if (
+            not math.isfinite(width)
+            or not math.isfinite(height)
+            or width <= 0.0
+            or height <= 0.0
+        ):
+            return None
+        return width, height
+
+    @classmethod
+    def _geometric_mean_ratio(cls, ratios) -> float:
+        logs: List[float] = []
+        for ratio in ratios:
+            clamped = cls._clamp_aspect_ratio(ratio)
+            if clamped > 0.0 and math.isfinite(clamped):
+                logs.append(math.log(clamped))
+        if not logs:
+            return 1.0
+        return cls._clamp_aspect_ratio(math.exp(sum(logs) / len(logs)))
+
+    @classmethod
+    def _clamp_aspect_ratio(cls, ratio: float) -> float:
+        low, high = cls.ASPECT_RATIO_LIMITS
+        if not math.isfinite(ratio) or ratio <= 0.0:
+            return 1.0
+        return min(max(float(ratio), low), high)
+
+    @staticmethod
+    def _safe_ratio(width: float, height: float) -> Optional[float]:
+        if (
+            not math.isfinite(width)
+            or not math.isfinite(height)
+            or width <= 0.0
+            or height <= 0.0
+        ):
+            return None
+        return float(width) / float(height)
 
     @classmethod
     def _boundary_frame_candidate(
