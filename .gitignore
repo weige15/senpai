@@ -21,6 +21,7 @@ baselines.json
 *.png
 *.svg
 *.pdf.txt
+*.pptx.pdf
 
 # Local environment files
 .env
