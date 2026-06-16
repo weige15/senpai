@@ -6,7 +6,6 @@ ICCAD 2026 FloorSet Challenge - Edge-GNN + DiT-Small + Hybrid B*-tree Contour Le
   1. 對齊網路結構：完全同步訓練端的 NetlistGNN, TimestepEmbedder 與 DiT 結構，
      徹底修復 Missing key "input_embedder" 與 Unexpected key "gnn_encoder" 的相容性錯誤。
   2. 亞秒級推論：維持 eval() 模式與 torch.no_grad() 保障，在 A100 上一秒內噴出優質佈局。
-  3. B*-tree Contour 後處理：100% 確保滿足大會 Overlap-free 等硬限制。
 """
 
 import math
