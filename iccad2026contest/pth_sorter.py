@@ -58,4 +58,4 @@ def check_all_checkpoints(folder_path):
 
 if __name__ == '__main__':
     # 將路徑指向你的 checkpoints 資料夾
-    check_all_checkpoints('checkpoints/')
+    check_all_checkpoints('checkpoints_fixed/')
