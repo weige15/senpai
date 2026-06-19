@@ -275,9 +275,9 @@ class HardConstraintNormalizer:
 
 
 class DiffusionGuidanceAdapter:
-    INFERENCE_TIMESTEPS = (999, 799, 599, 399, 199, 0)
-    UPDATE_DAMPING = 0.25
-    MIN_FINAL_STEP_SCALE = 0.20
+    INFERENCE_TIMESTEPS = (0,)
+    UPDATE_DAMPING = 1.0
+    MIN_FINAL_STEP_SCALE = 1.0
 
     @classmethod
     def build(
@@ -391,6 +391,8 @@ class DiffusionGuidanceAdapter:
         valid_area = problem.area_targets.to(device).unsqueeze(-1).float()
         valid_constraints = problem.constraints.to(device).float()
         b2b_conn_dev = problem.b2b_connectivity.to(device)
+        p2b_conn_dev = problem.p2b_connectivity.to(device)
+        pins_pos_dev = problem.pins_pos.to(device)
         coordinate_limit = cls._coordinate_limit(problem)
         model_calls = 0
 
@@ -402,6 +404,8 @@ class DiffusionGuidanceAdapter:
                     valid_area,
                     valid_constraints,
                     b2b_conn_dev,
+                    p2b_conn_dev,
+                    pins_pos_dev,
                     t_tensor,
                     problem.block_count,
                 )
@@ -3875,8 +3879,11 @@ class CandidateSelector:
 # =============================================================================
 # 1. NETLIST EDGE-GNN (電路圖拓樸特徵提取器) - 完全與訓練端對齊
 # =============================================================================
+PIN_FEATURE_DIM = 3
+
+
 class NetlistGNN(nn.Module):
-    def __init__(self, node_in_dim=6, hidden_dim=384):
+    def __init__(self, node_in_dim=6 + PIN_FEATURE_DIM, hidden_dim=384):
         super().__init__()
         self.node_init = nn.Sequential(
             nn.Linear(node_in_dim, hidden_dim),
@@ -3889,9 +3896,10 @@ class NetlistGNN(nn.Module):
             nn.Linear(hidden_dim, hidden_dim)
         )
 
-    def forward(self, constraints, area_target, b2b_conn, block_count):
+    def forward(self, constraints, area_target, b2b_conn, p2b_conn=None, pins_pos=None, block_count=None):
         N = block_count
-        raw_nodes = torch.cat([constraints, area_target], dim=-1)
+        pin_features = self._pin_features(area_target, p2b_conn, pins_pos, N)
+        raw_nodes = torch.cat([constraints, area_target, pin_features], dim=-1)
         h = self.node_init(raw_nodes)
         
         valid_mask = b2b_conn[:, 0] >= 0
@@ -3912,6 +3920,58 @@ class NetlistGNN(nn.Module):
             h = self.msg_merge(torch.cat([h, agg_msg], dim=-1))
             
         return h
+
+    @staticmethod
+    def _pin_features(area_target, p2b_conn, pins_pos, block_count):
+        features = torch.zeros(
+            block_count,
+            PIN_FEATURE_DIM,
+            device=area_target.device,
+            dtype=area_target.dtype,
+        )
+        if p2b_conn is None or pins_pos is None or p2b_conn.numel() == 0 or pins_pos.numel() == 0:
+            return features
+
+        valid_mask = p2b_conn[:, 0] >= 0
+        edges = p2b_conn[valid_mask]
+        if edges.numel() == 0:
+            return features
+
+        n_pins = pins_pos.shape[0]
+        pin_idx = edges[:, 0].long()
+        block_idx = edges[:, 1].long()
+        valid = (
+            (pin_idx >= 0) & (pin_idx < n_pins)
+            & (block_idx >= 0) & (block_idx < block_count)
+        )
+        if not valid.any():
+            return features
+
+        pin_idx = pin_idx[valid]
+        block_idx = block_idx[valid]
+        weight = edges[valid, 2].to(dtype=area_target.dtype).clamp_min(0.0)
+        pin_xy = pins_pos[pin_idx].to(dtype=area_target.dtype)
+        finite = torch.isfinite(pin_xy).all(dim=1)
+        if not finite.any():
+            return features
+
+        pin_xy = pin_xy[finite]
+        block_idx = block_idx[finite]
+        weight = weight[finite]
+        scale = torch.sqrt(area_target[:block_count, 0].clamp_min(0.0).sum().clamp_min(1.0))
+        contributions = torch.stack(
+            (
+                weight,
+                weight * pin_xy[:, 0] / scale,
+                weight * pin_xy[:, 1] / scale,
+            ),
+            dim=-1,
+        )
+        features.index_add_(0, block_idx, contributions)
+        weight_sum = features[:, 0:1]
+        features[:, 1:3] = features[:, 1:3] / weight_sum.clamp_min(1e-6)
+        features[:, 0:1] = torch.log1p(weight_sum)
+        return features
 
 
 # =============================================================================
@@ -3982,7 +4042,7 @@ class DiTSmallFloorplanBackbone(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.coord_embedder = nn.Linear(4, hidden_size)      
-        self.gnn_encoder = NetlistGNN(node_in_dim=5 + 1, hidden_dim=hidden_size)
+        self.gnn_encoder = NetlistGNN(node_in_dim=5 + 1 + PIN_FEATURE_DIM, hidden_dim=hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.cond_fusion = nn.Sequential(
             nn.Linear(hidden_size * 2, hidden_size),
@@ -4001,9 +4061,9 @@ class DiTSmallFloorplanBackbone(nn.Module):
             nn.Linear(hidden_size, 2 * hidden_size)
         )
 
-    def forward(self, noised_positions, area_target, constraints, b2b_conn, t, block_count):
+    def forward(self, noised_positions, area_target, constraints, b2b_conn, p2b_conn, pins_pos, t, block_count):
         x = self.coord_embedder(noised_positions)
-        gnn_feats = self.gnn_encoder(constraints, area_target, b2b_conn, block_count)
+        gnn_feats = self.gnn_encoder(constraints, area_target, b2b_conn, p2b_conn, pins_pos, block_count)
         gnn_feats_b = gnn_feats.unsqueeze(0)
         t_feat = self.t_embedder(t)
         t_feat_b = t_feat.unsqueeze(1).expand(-1, block_count, -1)

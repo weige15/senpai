@@ -17,10 +17,12 @@ import re
 import sys
 from pathlib import Path
 import math
+from typing import List, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset, Subset
 from torch.utils.data.distributed import DistributedSampler
@@ -37,8 +39,11 @@ from lite_dataset import FloorplanDatasetLite, floorplan_collate as train_floorp
 # =============================================================================
 # 1. NETLIST EDGE-GNN (電路圖拓樸特徵提取器)
 # =============================================================================
+PIN_FEATURE_DIM = 3
+
+
 class NetlistGNN(nn.Module):
-    def __init__(self, node_in_dim=6, hidden_dim=384):
+    def __init__(self, node_in_dim=6 + PIN_FEATURE_DIM, hidden_dim=384):
         super().__init__()
         self.node_init = nn.Sequential(
             nn.Linear(node_in_dim, hidden_dim),
@@ -51,12 +56,16 @@ class NetlistGNN(nn.Module):
             nn.Linear(hidden_dim, hidden_dim)
         )
 
-    def forward(self, constraints, area_target, b2b_conn, block_count):
+    def forward(self, constraints, area_target, b2b_conn, p2b_conn, pins_pos, block_count):
         single_sample = constraints.dim() == 2
         if single_sample:
             constraints = constraints.unsqueeze(0)
             area_target = area_target.unsqueeze(0)
             b2b_conn = b2b_conn.unsqueeze(0)
+            if p2b_conn is not None:
+                p2b_conn = p2b_conn.unsqueeze(0)
+            if pins_pos is not None:
+                pins_pos = pins_pos.unsqueeze(0)
 
         if area_target.dim() == 2:
             area_target = area_target.unsqueeze(-1)
@@ -75,7 +84,8 @@ class NetlistGNN(nn.Module):
             counts = torch.full((batch_size,), int(block_count), device=device, dtype=torch.long)
             node_mask = torch.arange(n_blocks, device=device).unsqueeze(0) < counts.unsqueeze(1)
 
-        raw_nodes = torch.cat([constraints, area_target], dim=-1)
+        pin_features = self._pin_features(area_target, p2b_conn, pins_pos, node_mask)
+        raw_nodes = torch.cat([constraints, area_target, pin_features], dim=-1)
         h = self.node_init(raw_nodes)
         h = h * node_mask.unsqueeze(-1).to(dtype=h.dtype)
 
@@ -108,6 +118,63 @@ class NetlistGNN(nn.Module):
             h = h * node_mask.unsqueeze(-1).to(dtype=h.dtype)
 
         return h.squeeze(0) if single_sample else h
+
+    @staticmethod
+    def _pin_features(area_target, p2b_conn, pins_pos, node_mask):
+        batch_size, n_blocks = node_mask.shape
+        features = torch.zeros(
+            batch_size,
+            n_blocks,
+            PIN_FEATURE_DIM,
+            device=area_target.device,
+            dtype=area_target.dtype,
+        )
+        if p2b_conn is None or pins_pos is None or p2b_conn.numel() == 0 or pins_pos.numel() == 0:
+            return features
+        if p2b_conn.dim() == 2:
+            p2b_conn = p2b_conn.unsqueeze(0)
+        if pins_pos.dim() == 2:
+            pins_pos = pins_pos.unsqueeze(0)
+
+        n_pins = pins_pos.shape[1]
+        pin_raw = p2b_conn[:, :, 0]
+        block_raw = p2b_conn[:, :, 1]
+        pin_idx = pin_raw.clamp(min=0, max=max(n_pins - 1, 0)).long()
+        block_idx = block_raw.clamp(min=0, max=max(n_blocks - 1, 0)).long()
+        valid = (
+            (pin_raw >= 0) & (block_raw >= 0)
+            & (pin_raw < n_pins) & (block_raw < n_blocks)
+            & node_mask.gather(1, block_idx)
+        )
+
+        pin_x = pins_pos[:, :, 0].to(dtype=area_target.dtype).gather(1, pin_idx)
+        pin_y = pins_pos[:, :, 1].to(dtype=area_target.dtype).gather(1, pin_idx)
+        valid = valid & torch.isfinite(pin_x) & torch.isfinite(pin_y)
+        weight = p2b_conn[:, :, 2].to(dtype=area_target.dtype).clamp_min(0.0)
+        weight = weight * valid.to(dtype=area_target.dtype)
+
+        scale = torch.sqrt(
+            (area_target.squeeze(-1).clamp_min(0.0) * node_mask.to(dtype=area_target.dtype))
+            .sum(dim=1)
+            .clamp_min(1.0)
+        ).view(batch_size, 1)
+        contributions = torch.stack(
+            (
+                weight,
+                weight * pin_x / scale,
+                weight * pin_y / scale,
+            ),
+            dim=-1,
+        )
+        features.scatter_add_(
+            1,
+            block_idx.unsqueeze(-1).expand(-1, -1, PIN_FEATURE_DIM),
+            contributions,
+        )
+        weight_sum = features[:, :, 0:1]
+        features[:, :, 1:3] = features[:, :, 1:3] / weight_sum.clamp_min(1e-6)
+        features[:, :, 0:1] = torch.log1p(weight_sum)
+        return features * node_mask.unsqueeze(-1).to(dtype=features.dtype)
 
 
 # =============================================================================
@@ -184,7 +251,7 @@ class DiTSmallFloorplanBackbone(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.coord_embedder = nn.Linear(4, hidden_size)      
-        self.gnn_encoder = NetlistGNN(node_in_dim=5 + 1, hidden_dim=hidden_size)
+        self.gnn_encoder = NetlistGNN(node_in_dim=5 + 1 + PIN_FEATURE_DIM, hidden_dim=hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.cond_fusion = nn.Sequential(
             nn.Linear(hidden_size * 2, hidden_size),
@@ -203,7 +270,7 @@ class DiTSmallFloorplanBackbone(nn.Module):
             nn.Linear(hidden_size, 2 * hidden_size)
         )
 
-    def forward(self, noised_positions, area_target, constraints, b2b_conn, t, block_count):
+    def forward(self, noised_positions, area_target, constraints, b2b_conn, p2b_conn, pins_pos, t, block_count):
         if noised_positions.dim() == 2:
             noised_positions = noised_positions.unsqueeze(0)
         batch_size, n_blocks, _ = noised_positions.shape
@@ -220,6 +287,10 @@ class DiTSmallFloorplanBackbone(nn.Module):
             constraints = constraints.unsqueeze(0)
         if b2b_conn.dim() == 2:
             b2b_conn = b2b_conn.unsqueeze(0)
+        if p2b_conn is not None and p2b_conn.dim() == 2:
+            p2b_conn = p2b_conn.unsqueeze(0)
+        if pins_pos is not None and pins_pos.dim() == 2:
+            pins_pos = pins_pos.unsqueeze(0)
 
         if isinstance(block_count, torch.Tensor):
             if block_count.dtype == torch.bool and block_count.dim() == 2:
@@ -240,7 +311,7 @@ class DiTSmallFloorplanBackbone(nn.Module):
 
         x = self.coord_embedder(noised_positions)
         x = x * block_mask.unsqueeze(-1).to(dtype=x.dtype)
-        gnn_feats = self.gnn_encoder(constraints, area_target, b2b_conn, block_count)
+        gnn_feats = self.gnn_encoder(constraints, area_target, b2b_conn, p2b_conn, pins_pos, block_count)
         t_feat = self.t_embedder(t)
         t_feat_b = t_feat.unsqueeze(1).expand(-1, n_blocks, -1)
         c_node = self.cond_fusion(torch.cat([gnn_feats, t_feat_b], dim=-1))
@@ -333,7 +404,18 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--noise-std", type=float, default=5.0)
+    parser.add_argument(
+        "--noise-std",
+        type=float,
+        default=0.0,
+        help="Legacy coordinate jitter. Keep 0.0 for rectified one-step training that matches inference.",
+    )
+    parser.add_argument(
+        "--supervised-weight",
+        type=float,
+        default=1.0,
+        help="Weight for normalized SmoothL1 x/y supervision against training labels.",
+    )
     parser.add_argument(
         "--grad-clip",
         type=float,
@@ -577,7 +659,97 @@ def loss_is_acceptable(loss: torch.Tensor, max_loss: float) -> bool:
     return True
 
 
-def compute_sample_loss(model, batch, sample_idx: int, device, max_blocks: int, noise_std: float):
+def _finite_float(value, default: float = 0.0) -> float:
+    try:
+        if torch.is_tensor(value):
+            value = value.detach().item()
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if math.isfinite(result) else default
+
+
+def build_initial_layout_batch(area_target: torch.Tensor, constraints: torch.Tensor, fp_sol: torch.Tensor) -> torch.Tensor:
+    batch_size, n_blocks = area_target.shape
+    result = torch.zeros(batch_size, n_blocks, 4, device=area_target.device, dtype=fp_sol.dtype)
+    valid_mask = area_target > 0
+    constraint_cols = constraints.shape[2] if constraints.dim() == 3 else 0
+
+    for sample_idx in range(batch_size):
+        dims: List[Tuple[float, float]] = []
+        valid_indices = []
+        for block_idx in range(n_blocks):
+            if not bool(valid_mask[sample_idx, block_idx].item()):
+                dims.append((0.0, 0.0))
+                continue
+            area = max(_finite_float(area_target[sample_idx, block_idx], 1.0), 1e-6)
+            side = math.sqrt(area)
+            is_fixed = constraint_cols > 0 and _finite_float(constraints[sample_idx, block_idx, 0]) != 0.0
+            is_preplaced = constraint_cols > 1 and _finite_float(constraints[sample_idx, block_idx, 1]) != 0.0
+            target_w = _finite_float(fp_sol[sample_idx, block_idx, 0], side)
+            target_h = _finite_float(fp_sol[sample_idx, block_idx, 1], side)
+            if (is_fixed or is_preplaced) and target_w > 0.0 and target_h > 0.0:
+                width, height = target_w, target_h
+            else:
+                width, height = side, side
+            dims.append((width, height))
+            valid_indices.append(block_idx)
+
+        total_area = sum(width * height for width, height in dims)
+        target_row_width = max(
+            1.0,
+            math.sqrt(max(total_area, 1.0)),
+            max((dims[i][0] for i in valid_indices), default=1.0),
+        )
+        x = 0.0
+        y = 0.0
+        row_height = 0.0
+        for block_idx in valid_indices:
+            width, height = dims[block_idx]
+            is_preplaced = constraint_cols > 1 and _finite_float(constraints[sample_idx, block_idx, 1]) != 0.0
+            if is_preplaced:
+                px = _finite_float(fp_sol[sample_idx, block_idx, 2], float("nan"))
+                py = _finite_float(fp_sol[sample_idx, block_idx, 3], float("nan"))
+                if math.isfinite(px) and math.isfinite(py):
+                    result[sample_idx, block_idx] = torch.tensor(
+                        (px, py, width, height),
+                        device=area_target.device,
+                        dtype=fp_sol.dtype,
+                    )
+                    continue
+            if x > 0.0 and x + width > target_row_width:
+                x = 0.0
+                y += row_height
+                row_height = 0.0
+            result[sample_idx, block_idx] = torch.tensor(
+                (x, y, width, height),
+                device=area_target.device,
+                dtype=fp_sol.dtype,
+            )
+            x += width
+            row_height = max(row_height, height)
+
+    return result
+
+
+def supervised_xy_loss(positions: torch.Tensor, ground_truth: torch.Tensor, area_target: torch.Tensor, block_mask: torch.Tensor) -> torch.Tensor:
+    scale = torch.sqrt(
+        (area_target.clamp_min(0.0) * block_mask.to(dtype=positions.dtype))
+        .sum(dim=1)
+        .clamp_min(1.0)
+    ).view(-1, 1, 1)
+    normalized_error = (positions[:, :, :2] - ground_truth[:, :, :2]) / scale
+    per_block = F.smooth_l1_loss(
+        normalized_error,
+        torch.zeros_like(normalized_error),
+        reduction="none",
+    ).sum(dim=-1)
+    return (
+        per_block * block_mask.to(dtype=positions.dtype)
+    ).sum(dim=1) / block_mask.sum(dim=1).to(dtype=positions.dtype).clamp_min(1.0)
+
+
+def compute_sample_loss(model, batch, sample_idx: int, device, max_blocks: int, noise_std: float, supervised_weight: float):
     area_target, b2b_conn, p2b_conn, pins_pos, constraints, _tree_sol, fp_sol, metrics = batch
 
     sample_area = area_target[sample_idx]
@@ -604,21 +776,29 @@ def compute_sample_loss(model, batch, sample_idx: int, device, max_blocks: int, 
         ground_truth[:, 1],
     ], dim=1)
 
-    t_step = torch.randint(0, 1000, (1,), device=device)
-    noise = torch.randn_like(gt_positions) * noise_std
-    noised_input = gt_positions + noise
+    base_layout = build_initial_layout_batch(
+        sample_area[:block_count].unsqueeze(0),
+        valid_constraints.unsqueeze(0),
+        sample_fp[:block_count].unsqueeze(0),
+    ).squeeze(0)
+    if noise_std > 0:
+        base_layout[:, :2] = base_layout[:, :2] + torch.randn_like(base_layout[:, :2]) * noise_std
+    t_step = torch.zeros((1,), device=device, dtype=torch.long)
 
-    predicted_denoise = model(
-        noised_input.unsqueeze(0),
+    predicted_delta = model(
+        base_layout.unsqueeze(0),
         valid_area,
         valid_constraints,
         sample_b2b,
+        sample_p2b,
+        sample_pins,
         t_step,
         block_count,
     )
-    positions = noised_input + predicted_denoise.squeeze(0)
+    positions = base_layout.clone()
+    positions[:, :2] = positions[:, :2] + predicted_delta.squeeze(0)[:, :2]
 
-    return compute_training_loss_differentiable(
+    proxy_loss = compute_training_loss_differentiable(
         positions,
         sample_b2b,
         sample_p2b,
@@ -626,9 +806,16 @@ def compute_sample_loss(model, batch, sample_idx: int, device, max_blocks: int, 
         sample_area[:block_count],
         sample_metrics,
     )
+    xy_loss = supervised_xy_loss(
+        positions.unsqueeze(0),
+        gt_positions.unsqueeze(0),
+        sample_area[:block_count].unsqueeze(0),
+        torch.ones((1, block_count), device=device, dtype=torch.bool),
+    )[0]
+    return proxy_loss + supervised_weight * xy_loss
 
 
-def compute_batch_loss(model, batch, device, max_blocks: int, noise_std: float):
+def compute_batch_loss(model, batch, device, max_blocks: int, noise_std: float, supervised_weight: float):
     area_target, b2b_conn, p2b_conn, pins_pos, constraints, _tree_sol, fp_sol, metrics = batch
 
     n_blocks = area_target.shape[1]
@@ -651,22 +838,26 @@ def compute_batch_loss(model, batch, device, max_blocks: int, noise_std: float):
     ], dim=-1)
     ground_truth = ground_truth.masked_fill(~block_mask.unsqueeze(-1), 0.0)
 
-    t_step = torch.randint(0, 1000, (area_target.shape[0],), device=device)
-    noise = torch.randn_like(ground_truth) * noise_std
-    noise = noise * block_mask.unsqueeze(-1).to(dtype=noise.dtype)
-    noised_input = ground_truth + noise
+    base_layout = build_initial_layout_batch(area_target, constraints, fp_sol)
+    if noise_std > 0:
+        jitter = torch.randn_like(base_layout[:, :, :2]) * noise_std
+        base_layout[:, :, :2] = base_layout[:, :, :2] + jitter * block_mask.unsqueeze(-1).to(dtype=jitter.dtype)
+    t_step = torch.zeros((area_target.shape[0],), device=device, dtype=torch.long)
 
-    predicted_denoise = model(
-        noised_input,
+    predicted_delta = model(
+        base_layout,
         area_target.unsqueeze(-1).float(),
         constraints,
         b2b_conn,
+        p2b_conn,
+        pins_pos,
         t_step,
         block_mask,
     )
-    positions = noised_input + predicted_denoise
+    positions = base_layout.clone()
+    positions[:, :, :2] = positions[:, :, :2] + predicted_delta[:, :, :2]
 
-    losses = compute_training_loss_differentiable_batch(
+    proxy_losses = compute_training_loss_differentiable_batch(
         positions,
         b2b_conn,
         p2b_conn,
@@ -675,6 +866,8 @@ def compute_batch_loss(model, batch, device, max_blocks: int, noise_std: float):
         metrics,
         block_mask=block_mask,
     )
+    xy_losses = supervised_xy_loss(positions, ground_truth, area_target, block_mask)
+    losses = proxy_losses + supervised_weight * xy_losses
     return losses[valid_samples].mean()
 
 
@@ -721,15 +914,17 @@ def main():
         while latest_pth is not None:
             log_main(rank, "[Auto-Resume] Found historical weights in checkpoint directory.")
             log_main(rank, f"[Auto-Resume] Checking checkpoint: '{latest_pth.name}'")
-            state_dict = strip_module_prefix(torch.load(latest_pth, map_location=device))
-            if state_dict_is_finite(state_dict):
-                model.load_state_dict(state_dict, strict=True)
-                loaded_checkpoint = True
-                log_main(rank, f"[Auto-Resume] Loaded checkpoint: '{latest_pth.name}'")
-                log_main(rank, f"[Auto-Resume] Resuming from Global Step: {resume_global_step}\n")
-                break
-
-            log_main(rank, f"[Auto-Resume] Skipping non-finite checkpoint: '{latest_pth.name}'")
+            try:
+                state_dict = strip_module_prefix(torch.load(latest_pth, map_location=device))
+                if state_dict_is_finite(state_dict):
+                    model.load_state_dict(state_dict, strict=True)
+                    loaded_checkpoint = True
+                    log_main(rank, f"[Auto-Resume] Loaded checkpoint: '{latest_pth.name}'")
+                    log_main(rank, f"[Auto-Resume] Resuming from Global Step: {resume_global_step}\n")
+                    break
+                log_main(rank, f"[Auto-Resume] Skipping non-finite checkpoint: '{latest_pth.name}'")
+            except Exception as exc:
+                log_main(rank, f"[Auto-Resume] Skipping incompatible checkpoint '{latest_pth.name}': {exc}")
             latest_pth, resume_global_step = find_latest_checkpoint(
                 checkpoint_folder,
                 len(dataloader),
@@ -796,6 +991,7 @@ def main():
                         device,
                         args.max_blocks,
                         args.noise_std,
+                        args.supervised_weight,
                     )
                     if batch_loss is None:
                         continue
