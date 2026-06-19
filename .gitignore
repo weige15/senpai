@@ -35,3 +35,4 @@ floorset_lite
 noML_optimizer.py
 iccad2026contest/pth.ipynb
 iccad2026contest/legalizer_slides/
+*.json
