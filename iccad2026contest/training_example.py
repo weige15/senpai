@@ -250,6 +250,7 @@ class DiTSmallFloorplanBackbone(nn.Module):
     def __init__(self, hidden_size=384, depth=12, num_heads=6):
         super().__init__()
         self.hidden_size = hidden_size
+        self.register_buffer("coordinate_contract_version", torch.tensor(2, dtype=torch.long))
         self.coord_embedder = nn.Linear(4, hidden_size)      
         self.gnn_encoder = NetlistGNN(node_in_dim=5 + 1 + PIN_FEATURE_DIM, hidden_dim=hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -309,7 +310,13 @@ class DiTSmallFloorplanBackbone(nn.Module):
         if t.numel() == 1 and batch_size > 1:
             t = t.expand(batch_size)
 
-        x = self.coord_embedder(noised_positions)
+        coord_scale = torch.sqrt(
+            (area_target.squeeze(-1).clamp_min(0.0) * block_mask.to(dtype=area_target.dtype))
+            .sum(dim=1)
+            .clamp_min(1.0)
+        ).view(batch_size, 1, 1).to(device=noised_positions.device, dtype=noised_positions.dtype)
+
+        x = self.coord_embedder(noised_positions / coord_scale)
         x = x * block_mask.unsqueeze(-1).to(dtype=x.dtype)
         gnn_feats = self.gnn_encoder(constraints, area_target, b2b_conn, p2b_conn, pins_pos, block_count)
         t_feat = self.t_embedder(t)
@@ -323,7 +330,7 @@ class DiTSmallFloorplanBackbone(nn.Module):
 
         shift, scale = self.final_adaLN(t_feat).chunk(2, dim=-1)
         x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-        output = self.final_layer(x)
+        output = self.final_layer(x) * coord_scale
         return output * block_mask.unsqueeze(-1).to(dtype=output.dtype)
 
 
@@ -815,7 +822,15 @@ def compute_sample_loss(model, batch, sample_idx: int, device, max_blocks: int, 
     return proxy_loss + supervised_weight * xy_loss
 
 
-def compute_batch_loss(model, batch, device, max_blocks: int, noise_std: float, supervised_weight: float):
+def compute_batch_loss(
+    model,
+    batch,
+    device,
+    max_blocks: int,
+    noise_std: float,
+    supervised_weight: float,
+    return_components: bool = False,
+):
     area_target, b2b_conn, p2b_conn, pins_pos, constraints, _tree_sol, fp_sol, metrics = batch
 
     n_blocks = area_target.shape[1]
@@ -868,7 +883,15 @@ def compute_batch_loss(model, batch, device, max_blocks: int, noise_std: float, 
     )
     xy_losses = supervised_xy_loss(positions, ground_truth, area_target, block_mask)
     losses = proxy_losses + supervised_weight * xy_losses
-    return losses[valid_samples].mean()
+    valid_losses = losses[valid_samples]
+    mean_loss = valid_losses.mean()
+    if return_components:
+        return (
+            mean_loss,
+            proxy_losses[valid_samples].mean().detach(),
+            xy_losses[valid_samples].mean().detach(),
+        )
+    return mean_loss
 
 
 # =============================================================================
@@ -975,6 +998,8 @@ def main():
 
             model.train()
             epoch_loss = torch.zeros((), device=device)
+            epoch_proxy_loss = torch.zeros((), device=device)
+            epoch_xy_loss = torch.zeros((), device=device)
             processed_batches = 0
 
             for batch_idx, batch in enumerate(dataloader):
@@ -985,16 +1010,18 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
 
                 with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
-                    batch_loss = compute_batch_loss(
+                    loss_result = compute_batch_loss(
                         model,
                         batch,
                         device,
                         args.max_blocks,
                         args.noise_std,
                         args.supervised_weight,
+                        return_components=True,
                     )
-                    if batch_loss is None:
+                    if loss_result is None:
                         continue
+                    batch_loss, batch_proxy_loss, batch_xy_loss = loss_result
 
                 local_loss_ok = loss_is_acceptable(batch_loss, args.max_loss)
                 if not all_ranks_true(local_loss_ok, device, distributed):
@@ -1049,14 +1076,22 @@ def main():
                 processed_batches += 1
 
                 log_loss = reduce_mean(batch_loss, distributed, world_size)
+                log_proxy_loss = reduce_mean(batch_proxy_loss, distributed, world_size)
+                log_xy_loss = reduce_mean(batch_xy_loss, distributed, world_size)
                 epoch_loss = epoch_loss + log_loss
+                epoch_proxy_loss = epoch_proxy_loss + log_proxy_loss
+                epoch_xy_loss = epoch_xy_loss + log_xy_loss
 
                 if args.log_freq > 0 and global_step % args.log_freq == 0:
                     log_loss_value = log_loss.item()
+                    log_proxy_value = log_proxy_loss.item()
+                    log_xy_value = log_xy_loss.item()
                     log_main(
                         rank,
                         f"  Batch [{batch_idx + 1}/{len(dataloader)}] "
-                        f"(Global Step {global_step}) -> Loss: {log_loss_value:.4f}",
+                        f"(Global Step {global_step}) -> Loss: {log_loss_value:.4f} "
+                        f"(proxy={log_proxy_value:.4f}, xy={log_xy_value:.4f}, "
+                        f"wxy={args.supervised_weight * log_xy_value:.4f})",
                     )
 
                 if args.save_freq_batches > 0 and global_step % args.save_freq_batches == 0:
@@ -1074,7 +1109,14 @@ def main():
 
             if processed_batches > 0:
                 avg_epoch_loss = (epoch_loss / processed_batches).item()
-                log_main(rank, f"Epoch {epoch} Completed. Average Loss: {avg_epoch_loss:.4f}")
+                avg_epoch_proxy = (epoch_proxy_loss / processed_batches).item()
+                avg_epoch_xy = (epoch_xy_loss / processed_batches).item()
+                log_main(
+                    rank,
+                    f"Epoch {epoch} Completed. Average Loss: {avg_epoch_loss:.4f} "
+                    f"(proxy={avg_epoch_proxy:.4f}, xy={avg_epoch_xy:.4f}, "
+                    f"wxy={args.supervised_weight * avg_epoch_xy:.4f})",
+                )
 
             if not all_ranks_true(model_state_is_finite(model), device, distributed):
                 raise FloatingPointError(

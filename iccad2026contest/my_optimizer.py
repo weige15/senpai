@@ -4041,6 +4041,7 @@ class DiTSmallFloorplanBackbone(nn.Module):
     def __init__(self, hidden_size=384, depth=12, num_heads=6):
         super().__init__()
         self.hidden_size = hidden_size
+        self.register_buffer("coordinate_contract_version", torch.tensor(2, dtype=torch.long))
         self.coord_embedder = nn.Linear(4, hidden_size)      
         self.gnn_encoder = NetlistGNN(node_in_dim=5 + 1 + PIN_FEATURE_DIM, hidden_dim=hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -4062,7 +4063,9 @@ class DiTSmallFloorplanBackbone(nn.Module):
         )
 
     def forward(self, noised_positions, area_target, constraints, b2b_conn, p2b_conn, pins_pos, t, block_count):
-        x = self.coord_embedder(noised_positions)
+        coord_scale = torch.sqrt(area_target[:, 0].clamp_min(0.0).sum().clamp_min(1.0))
+        coord_scale = coord_scale.to(device=noised_positions.device, dtype=noised_positions.dtype).view(1, 1, 1)
+        x = self.coord_embedder(noised_positions / coord_scale)
         gnn_feats = self.gnn_encoder(constraints, area_target, b2b_conn, p2b_conn, pins_pos, block_count)
         gnn_feats_b = gnn_feats.unsqueeze(0)
         t_feat = self.t_embedder(t)
@@ -4074,7 +4077,7 @@ class DiTSmallFloorplanBackbone(nn.Module):
             
         shift, scale = self.final_adaLN(t_feat).chunk(2, dim=-1)
         x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-        output = self.final_layer(x)
+        output = self.final_layer(x) * coord_scale
         return output
 
 
