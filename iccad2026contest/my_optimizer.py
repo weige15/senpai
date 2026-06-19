@@ -71,6 +71,7 @@ class Guidance:
     predicted_positions: Dict[int, Tuple[float, float]]
     available: bool
     warnings: List[str]
+    model_calls: int = 0
 
 
 @dataclass
@@ -274,6 +275,10 @@ class HardConstraintNormalizer:
 
 
 class DiffusionGuidanceAdapter:
+    INFERENCE_TIMESTEPS = (999, 799, 599, 399, 199, 0)
+    UPDATE_DAMPING = 0.25
+    MIN_FINAL_STEP_SCALE = 0.20
+
     @classmethod
     def build(
         cls,
@@ -290,27 +295,8 @@ class DiffusionGuidanceAdapter:
             return Guidance([], {}, {}, False, [])
 
         try:
-            initial_guess = cls._initial_guess(problem, device)
-            valid_area = problem.area_targets.to(device).unsqueeze(-1).float()
-            valid_constraints = problem.constraints.to(device).float()
-            b2b_conn_dev = problem.b2b_connectivity.to(device)
-            t_tensor = torch.tensor([0], device=device)
-
-            with torch.no_grad():
-                predicted_offset = model(
-                    initial_guess.unsqueeze(0),
-                    valid_area,
-                    valid_constraints,
-                    b2b_conn_dev,
-                    t_tensor,
-                    problem.block_count,
-                )
-
-            predicted_xy = cls._parse_prediction(
-                problem,
-                initial_guess,
-                predicted_offset,
-            )
+            predicted_layout, model_calls = cls._denoise_layout(problem, model, device)
+            predicted_xy = cls._parse_prediction(problem, predicted_layout)
         except (IndexError, RuntimeError, TypeError, ValueError) as exc:
             return cls._fallback(problem, f"model_guidance_failed:{type(exc).__name__}")
         finally:
@@ -346,6 +332,7 @@ class DiffusionGuidanceAdapter:
             predicted_positions=predicted_positions,
             available=True,
             warnings=[],
+            model_calls=model_calls,
         )
 
     @staticmethod
@@ -360,21 +347,96 @@ class DiffusionGuidanceAdapter:
 
     @staticmethod
     def _initial_guess(problem: NormalizedProblem, device: torch.device) -> torch.Tensor:
-        return torch.tensor(
-            [
-                (0.0, 0.0, block.width, block.height)
-                for block in problem.blocks
-            ],
-            dtype=torch.float32,
-            device=device,
+        total_area = sum(max(0.0, block.width * block.height) for block in problem.blocks)
+        target_row_width = max(
+            1.0,
+            math.sqrt(max(total_area, 1.0)),
+            max((block.width for block in problem.blocks), default=1.0),
         )
+        positions: List[Tuple[float, float, float, float]] = [
+            (0.0, 0.0, block.width, block.height)
+            for block in problem.blocks
+        ]
+        x = 0.0
+        y = 0.0
+        row_height = 0.0
+        for block in problem.blocks:
+            if block.is_preplaced and block.preplaced_x is not None and block.preplaced_y is not None:
+                positions[block.index] = (
+                    float(block.preplaced_x),
+                    float(block.preplaced_y),
+                    float(block.width),
+                    float(block.height),
+                )
+                continue
+            if x > 0.0 and x + block.width > target_row_width:
+                x = 0.0
+                y += row_height
+                row_height = 0.0
+            positions[block.index] = (x, y, block.width, block.height)
+            x += block.width
+            row_height = max(row_height, block.height)
+
+        return torch.tensor(positions, dtype=torch.float32, device=device)
+
+    @classmethod
+    def _denoise_layout(
+        cls,
+        problem: NormalizedProblem,
+        model: nn.Module,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, int]:
+        base_layout = cls._initial_guess(problem, device)
+        layout = base_layout.clone()
+        valid_area = problem.area_targets.to(device).unsqueeze(-1).float()
+        valid_constraints = problem.constraints.to(device).float()
+        b2b_conn_dev = problem.b2b_connectivity.to(device)
+        coordinate_limit = cls._coordinate_limit(problem)
+        model_calls = 0
+
+        with torch.no_grad():
+            for timestep in cls.INFERENCE_TIMESTEPS:
+                t_tensor = torch.tensor([timestep], device=device)
+                predicted_offset = model(
+                    layout.unsqueeze(0),
+                    valid_area,
+                    valid_constraints,
+                    b2b_conn_dev,
+                    t_tensor,
+                    problem.block_count,
+                )
+                model_calls += 1
+                delta_xy = cls._parse_xy_delta(problem, predicted_offset)
+                if delta_xy is None:
+                    raise ValueError("invalid_model_prediction")
+                delta_xy = torch.nan_to_num(
+                    delta_xy,
+                    nan=0.0,
+                    posinf=coordinate_limit,
+                    neginf=-coordinate_limit,
+                ).clamp(-coordinate_limit, coordinate_limit)
+                step_scale = cls.UPDATE_DAMPING * max(
+                    cls.MIN_FINAL_STEP_SCALE,
+                    (float(timestep) + 1.0) / 1000.0,
+                )
+                layout[:, :2] = (layout[:, :2] + step_scale * delta_xy).clamp(
+                    -coordinate_limit,
+                    coordinate_limit,
+                )
+                layout[:, 2:] = base_layout[:, 2:]
+
+        return layout, model_calls
 
     @staticmethod
-    def _parse_prediction(
+    def _coordinate_limit(problem: NormalizedProblem) -> float:
+        span = sum(max(block.width, block.height) for block in problem.blocks)
+        return max(10.0, 2.0 * span)
+
+    @staticmethod
+    def _parse_xy_delta(
         problem: NormalizedProblem,
-        initial_guess: torch.Tensor,
         predicted_offset: torch.Tensor,
-    ) -> Optional[Dict[int, Tuple[float, float]]]:
+    ) -> Optional[torch.Tensor]:
         if predicted_offset is None or not isinstance(predicted_offset, torch.Tensor):
             return None
         if predicted_offset.dim() == 3:
@@ -386,17 +448,26 @@ class DiffusionGuidanceAdapter:
         if predicted_offset.shape[0] < problem.block_count or predicted_offset.shape[1] < 2:
             return None
 
-        predicted_offset = predicted_offset[:problem.block_count]
-        if predicted_offset.shape[1] >= 4:
-            predicted_layout = initial_guess + predicted_offset[:, :4]
-        else:
-            predicted_layout = initial_guess.clone()
-            predicted_layout[:, :2] = initial_guess[:, :2] + predicted_offset[:, :2]
+        delta_xy = predicted_offset[:problem.block_count, :2]
+        if not torch.isfinite(delta_xy).all():
+            return None
+        return delta_xy
 
-        if not torch.isfinite(predicted_layout[:, :2]).all():
+    @staticmethod
+    def _parse_prediction(
+        problem: NormalizedProblem,
+        predicted_layout: torch.Tensor,
+    ) -> Optional[Dict[int, Tuple[float, float]]]:
+        if predicted_layout is None or not isinstance(predicted_layout, torch.Tensor):
+            return None
+        if predicted_layout.dim() != 2:
+            return None
+        if predicted_layout.shape[0] < problem.block_count or predicted_layout.shape[1] < 2:
+            return None
+        if not torch.isfinite(predicted_layout[:problem.block_count, :2]).all():
             return None
 
-        predicted_cpu = predicted_layout[:, :2].detach().cpu()
+        predicted_cpu = predicted_layout[:problem.block_count, :2].detach().cpu()
         return {
             i: (float(predicted_cpu[i, 0].item()), float(predicted_cpu[i, 1].item()))
             for i in range(problem.block_count)
@@ -4118,6 +4189,14 @@ class MyOptimizer(FloorplanOptimizer):
             self.device,
             checkpoint_loaded=self.checkpoint_loaded,
         )
+        if self.verbose:
+            print(
+                "--> ML guidance: "
+                f"available={guidance.available}, "
+                f"model_calls={guidance.model_calls}, "
+                f"predictions={len(guidance.predicted_positions)}, "
+                f"warnings={guidance.warnings[:4]}"
+            )
 
         # =========================================================================
         # 階段三：Anchor-aware legalization ── preplaced anchors are obstacles
@@ -4143,7 +4222,7 @@ class MyOptimizer(FloorplanOptimizer):
                 print(f"--> Constructive candidate path skipped: {type(exc).__name__}")
 
         for candidate_index, (source, positions) in enumerate(constructive_candidates, start=1):
-            candidate_positions.append((source, candidate_index, positions))
+            candidate_positions.append((f"constructive_ml:{source}", candidate_index, positions))
 
         next_candidate_index = max(
             (source_order for _, source_order, _ in candidate_positions),
@@ -4172,12 +4251,33 @@ class MyOptimizer(FloorplanOptimizer):
                     neutral_source = f"constructive_neutral:{source}"
                 candidate_positions.append((neutral_source, next_candidate_index, positions))
 
+        if self.verbose:
+            ml_candidates = sum(
+                1 for source, _, _ in candidate_positions
+                if source.startswith("ml_") or source.startswith("constructive_ml:")
+            )
+            neutral_candidates_count = sum(
+                1 for source, _, _ in candidate_positions
+                if source.startswith("constructive_neutral:")
+            )
+            print(
+                "--> Candidate pool: "
+                f"total={len(candidate_positions)}, "
+                f"ml_guided={ml_candidates}, "
+                f"neutral={neutral_candidates_count}"
+            )
+
         best_candidate = CandidateSelector.best_feasible(
             problem,
             candidate_positions,
             checker,
         )
         if best_candidate is not None:
+            if self.verbose:
+                print(
+                    "--> Selected candidate: "
+                    f"source={best_candidate.source}, key={best_candidate.key}"
+                )
             return best_candidate.positions
 
         optimized_report = checker.check(placement_state.as_positions(problem), problem)
