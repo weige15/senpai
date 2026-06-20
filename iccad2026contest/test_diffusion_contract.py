@@ -39,12 +39,14 @@ def main():
         max_blocks=3,
         noise_std=0.0,
         supervised_weight=1.0,
+        proxy_weight=0.0,
         return_components=True,
     )
     assert loss is not None
     assert torch.isfinite(loss).all()
     assert torch.isfinite(proxy_loss).all()
     assert torch.isfinite(xy_loss).all()
+    assert torch.allclose(loss, xy_loss)
 
 
 if __name__ == "__main__":

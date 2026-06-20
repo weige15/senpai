@@ -424,6 +424,12 @@ def parse_args():
         help="Weight for normalized SmoothL1 x/y supervision against training labels.",
     )
     parser.add_argument(
+        "--proxy-weight",
+        type=float,
+        default=1.0,
+        help="Weight for differentiable HPWL/area proxy loss. Use 0 for x/y overfit diagnostics.",
+    )
+    parser.add_argument(
         "--grad-clip",
         type=float,
         default=1.0,
@@ -756,7 +762,16 @@ def supervised_xy_loss(positions: torch.Tensor, ground_truth: torch.Tensor, area
     ).sum(dim=1) / block_mask.sum(dim=1).to(dtype=positions.dtype).clamp_min(1.0)
 
 
-def compute_sample_loss(model, batch, sample_idx: int, device, max_blocks: int, noise_std: float, supervised_weight: float):
+def compute_sample_loss(
+    model,
+    batch,
+    sample_idx: int,
+    device,
+    max_blocks: int,
+    noise_std: float,
+    supervised_weight: float,
+    proxy_weight: float,
+):
     area_target, b2b_conn, p2b_conn, pins_pos, constraints, _tree_sol, fp_sol, metrics = batch
 
     sample_area = area_target[sample_idx]
@@ -819,7 +834,7 @@ def compute_sample_loss(model, batch, sample_idx: int, device, max_blocks: int, 
         sample_area[:block_count].unsqueeze(0),
         torch.ones((1, block_count), device=device, dtype=torch.bool),
     )[0]
-    return proxy_loss + supervised_weight * xy_loss
+    return proxy_weight * proxy_loss + supervised_weight * xy_loss
 
 
 def compute_batch_loss(
@@ -829,6 +844,7 @@ def compute_batch_loss(
     max_blocks: int,
     noise_std: float,
     supervised_weight: float,
+    proxy_weight: float = 1.0,
     return_components: bool = False,
 ):
     area_target, b2b_conn, p2b_conn, pins_pos, constraints, _tree_sol, fp_sol, metrics = batch
@@ -882,7 +898,7 @@ def compute_batch_loss(
         block_mask=block_mask,
     )
     xy_losses = supervised_xy_loss(positions, ground_truth, area_target, block_mask)
-    losses = proxy_losses + supervised_weight * xy_losses
+    losses = proxy_weight * proxy_losses + supervised_weight * xy_losses
     valid_losses = losses[valid_samples]
     mean_loss = valid_losses.mean()
     if return_components:
@@ -1017,6 +1033,7 @@ def main():
                         args.max_blocks,
                         args.noise_std,
                         args.supervised_weight,
+                        args.proxy_weight,
                         return_components=True,
                     )
                     if loss_result is None:
@@ -1091,6 +1108,7 @@ def main():
                         f"  Batch [{batch_idx + 1}/{len(dataloader)}] "
                         f"(Global Step {global_step}) -> Loss: {log_loss_value:.4f} "
                         f"(proxy={log_proxy_value:.4f}, xy={log_xy_value:.4f}, "
+                        f"wproxy={args.proxy_weight * log_proxy_value:.4f}, "
                         f"wxy={args.supervised_weight * log_xy_value:.4f})",
                     )
 
@@ -1115,6 +1133,7 @@ def main():
                     rank,
                     f"Epoch {epoch} Completed. Average Loss: {avg_epoch_loss:.4f} "
                     f"(proxy={avg_epoch_proxy:.4f}, xy={avg_epoch_xy:.4f}, "
+                    f"wproxy={args.proxy_weight * avg_epoch_proxy:.4f}, "
                     f"wxy={args.supervised_weight * avg_epoch_xy:.4f})",
                 )
 
